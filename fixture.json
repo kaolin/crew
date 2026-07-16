@@ -1,0 +1,7 @@
+[
+  {"pid":71950,"cwd":"/Users/kaolin/dev/izzit","kind":"interactive","startedAt":1784042651244,"sessionId":"ff10d5a8-b98c-4cf5-8323-68b28e06a778","name":"izzit-2b","status":"idle"},
+  {"pid":13495,"cwd":"/Users/kaolin/dev/orrery","kind":"interactive","startedAt":1783973007701,"sessionId":"dcaf91b8-0d86-4c3c-a68b-c824a0394cb6","name":"orrery-4c","status":"busy"},
+  {"pid":13592,"cwd":"/Users/kaolin","kind":"interactive","startedAt":1783990974059,"sessionId":"c8d1b743-25f9-466a-bd27-d850bfc3d581","name":"kaolin-e8","status":"waiting","waitingFor":"permission prompt"},
+  {"pid":19369,"cwd":"/Users/kaolin/dev/spacetag","kind":"interactive","startedAt":1783973656165,"sessionId":"574df9b9-1e1d-45dc-b8fd-a1dfe9e2cf4a","name":"spacetag-fa","status":"idle"},
+  {"pid":42312,"cwd":"/Users/kaolin/dev/games/SpotTheHustle","kind":"interactive","startedAt":1783977190495,"sessionId":"a9b65dc2-30f6-4b7b-be2d-3634bbf7d3fe","name":"spotthehustle-90","status":"busy"}
+]

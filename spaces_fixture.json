@@ -1,0 +1,8 @@
+[
+  {"index": 1, "uuid": "U1", "current": true,  "tag": "chat"},
+  {"index": 2, "uuid": "U2", "current": false, "tag": "fractroam"},
+  {"index": 3, "uuid": "U3", "current": false, "tag": "spot the hustle"},
+  {"index": 4, "uuid": "U4", "current": false, "tag": "izzit"},
+  {"index": 5, "uuid": "U5", "current": false, "tag": "thereby"},
+  {"index": 6, "uuid": "U6", "current": false, "tag": "sandpainting / disasteroids / magic message"}
+]

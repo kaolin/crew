@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""crew — a read-only status console + restore map for your hand-run Claude Code sessions.
+
+Feeds off `claude agents --json` (Claude Code >= 2.1.139), which reports every
+running session — including the interactive TUIs you started yourself — with cwd,
+sessionId, name, and live status (idle / busy / waiting[+waitingFor]).
+
+Subcommands:
+  status    glanceable, project-grouped view (default; pure read)
+  snapshot  save the current session list as a restore manifest (pure read)
+  restore   from a manifest, resume every session in a fresh iTerm2 window
+            (DRY-RUN by default — prints what it would do; pass --go to execute)
+
+stdlib only — no pip/conda env needed.
+"""
+import sys, os, json, time, subprocess, argparse, shutil
+
+HOME = os.path.expanduser("~")
+SNAP_DIR = os.path.join(HOME, ".crew")
+PLIST_LABEL = "com.kaolin.crew-snapshot"
+
+# lower rank = more urgent / sorts first
+STATUS_RANK = {"waiting": 0, "busy": 1, "idle": 2, "completed": 3, "stopped": 4, "failed": 5}
+STATUS_STYLE = {
+    "waiting":   ("33;1", "●"),  # yellow  — needs you
+    "busy":      ("36;1", "▶"),  # cyan    — working
+    "idle":      ("32",   "○"),  # green   — idle at prompt
+    "completed": ("2",    "✓"),
+    "stopped":   ("2",    "■"),
+    "failed":    ("31;1", "✗"),
+}
+
+
+def c(code, s):
+    if not sys.stdout.isatty():
+        return s
+    return f"\033[{code}m{s}\033[0m"
+
+
+def _claude_bin():
+    """Resolve the claude CLI even under a bare launchd PATH (bash login PATH != zsh)."""
+    return (os.environ.get("CREW_CLAUDE")
+            or shutil.which("claude")
+            or os.path.expanduser("~/.local/bin/claude"))
+
+
+def load(source=None, include_all=False):
+    if source == "-":
+        raw = sys.stdin.read()
+    elif source:
+        with open(source) as f:
+            raw = f.read()
+    else:
+        cmd = [_claude_bin(), "agents", "--json"]
+        if include_all:
+            cmd.append("--all")
+        raw = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    return json.loads(raw)
+
+
+def age(ms):
+    if not ms:
+        return "?"
+    s = max(0, int(time.time() * 1000 - ms) // 1000)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h{m:02d}m"
+    d, h = divmod(h, 24)
+    return f"{d}d{h}h"
+
+
+def proj(cwd):
+    return os.path.basename((cwd or "").rstrip("/")) or (cwd or "?")
+
+
+def shq(p):
+    return "'" + p.replace("'", "'\\''") + "'"
+
+
+def cmd_status(a):
+    sessions = load(a.source, a.all)
+    if not sessions:
+        print("no running Claude sessions.")
+        return
+    groups = {}
+    for s in sessions:
+        groups.setdefault(s.get("cwd", "?"), []).append(s)
+    # order groups by their most-urgent session, then by project name
+    order = sorted(
+        groups.items(),
+        key=lambda kv: (min(STATUS_RANK.get(x.get("status"), 9) for x in kv[1]), proj(kv[0])),
+    )
+    tally = {}
+    for s in sessions:
+        tally[s.get("status", "?")] = tally.get(s.get("status", "?"), 0) + 1
+    parts = [f"{n} {k}" for k, n in sorted(tally.items(), key=lambda kv: STATUS_RANK.get(kv[0], 9))]
+    print(c("1", f"\n  {len(sessions)} sessions") + c("2", "   ·   " + "   ·   ".join(parts)) + "\n")
+    for cwd, items in order:
+        items.sort(key=lambda x: STATUS_RANK.get(x.get("status"), 9))
+        print("  " + c("1", proj(cwd)) + c("2", f"   {cwd}"))
+        for s in items:
+            st = s.get("status", "?")
+            code, glyph = STATUS_STYLE.get(st, ("0", "?"))
+            line = (f"    {c(code, glyph)} {c(code, st.ljust(9))} "
+                    f"{(s.get('name') or '').ljust(20)} {c('2', age(s.get('startedAt')).rjust(6))}")
+            if s.get("waitingFor"):
+                line += c("33", f"   ⟵ {s['waitingFor']}")
+            print(line)
+        print()
+
+
+def cmd_snapshot(a):
+    sessions = load(a.source, include_all=False)
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    path = a.out or os.path.join(SNAP_DIR, "latest.json")
+    spaces = _spaces(a.spaces_source)
+    manifest = []
+    for s in sessions:
+        sp = _space_for_session(s, spaces) if spaces else None
+        manifest.append({
+            "cwd": s.get("cwd"), "sessionId": s.get("sessionId"),
+            "name": s.get("name"), "status": s.get("status"),
+            "space": sp.get("uuid") if sp else None,
+            "spaceIndex": sp.get("index") if sp else None,
+            "spaceTag": sp.get("tag") if sp else None,
+        })
+    # Safety: never let an empty/shrunk read (e.g. the launchd tick firing during
+    # shutdown, when sessions are already dying) clobber a good reboot map.
+    if not manifest and os.path.exists(path) and not a.force:
+        try:
+            prev = json.load(open(path))
+        except Exception:
+            prev = []
+        if prev:
+            print(f"skip: 0 live sessions — keeping last good map ({len(prev)}) at {path}")
+            return
+    with open(path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    if manifest and not a.out:  # keep a timestamped history of good maps
+        hist = os.path.join(SNAP_DIR, "history")
+        os.makedirs(hist, exist_ok=True)
+        with open(os.path.join(hist, f"{int(time.time())}.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+    print(f"snapshotted {len(manifest)} sessions → {path}")
+
+
+def cmd_restore(a):
+    path = a.source or os.path.join(SNAP_DIR, "latest.json")
+    with open(path) as f:
+        manifest = json.load(f)
+    print(f"# restore {len(manifest)} sessions from {path}\n")
+    launched = 0
+    for s in manifest:
+        cwd, sid, name = s.get("cwd"), s.get("sessionId"), s.get("name") or ""
+        if not cwd or not sid:
+            continue
+        space = s.get("space")
+        where = f"Space {s.get('spaceIndex')} · {s.get('spaceTag')}" if space else "current Space"
+        resume = f"cd {shq(cwd)} && claude --resume {sid}"
+        if a.go:
+            if space:
+                subprocess.run([_spacetag_bin(), "goto", str(space)])  # land the new window on its Space
+            script = ('tell application "iTerm2"\n'
+                      '  create window with default profile\n'
+                      '  tell current session of current window\n'
+                      f'    set name to "{name}"\n'
+                      f'    write text "{resume}"\n'
+                      '  end tell\n'
+                      'end tell')
+            subprocess.run(["osascript", "-e", script], check=False)
+            print(f"  ✓ {name.ljust(20)} → {where}")
+        else:
+            print(f"  would put {name.ljust(20)} → {where}   ({resume})")
+        launched += 1
+    if not a.go:
+        print(f"\n# dry-run: {launched} sessions. re-run with --go to open + place + resume.")
+
+
+# ---- dispatch: attach to the live iTerm2 session behind a Claude pid ----
+
+def _resolve(sessions, key):
+    """Find sessions by exact name, name-prefix, project, then substring."""
+    for pred in (
+        lambda s: (s.get("name") or "") == key,
+        lambda s: (s.get("name") or "").startswith(key),
+        lambda s: proj(s.get("cwd")) == key,
+        lambda s: key.lower() in ((s.get("name") or "") + " " + (s.get("cwd") or "")).lower(),
+    ):
+        hit = [s for s in sessions if pred(s)]
+        if hit:
+            return hit
+    return []
+
+
+def _tty_of(pid):
+    if not pid:
+        return None
+    out = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return None if not out or out == "??" else "/dev/" + out
+
+
+# AppleScript takes (tty[, msg]) via `on run argv`, so we never string-escape into the script body.
+_OSA_PEEK = """on run argv
+  set target to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (tty of s) is target then return contents of s
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "__NOTFOUND__"
+end run"""
+
+_OSA_TELL = """on run argv
+  set target to item 1 of argv
+  set msg to item 2 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (tty of s) is target then
+            tell s to write text msg
+            return "__OK__"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "__NOTFOUND__"
+end run"""
+
+_OSA_JUMP = """on run argv
+  set target to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (tty of s) is target then
+            select s
+            tell t to select
+            tell w to select
+            activate
+            return "__OK__"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "__NOTFOUND__"
+end run"""
+
+
+def _pick(name):
+    sessions = load()
+    matches = _resolve(sessions, name)
+    if not matches:
+        print(f"no running session matches '{name}'")
+        return None, None
+    if len(matches) > 1:
+        print(f"'{name}' is ambiguous — matches:")
+        for m in matches:
+            print(f"    {m.get('name')}   {proj(m.get('cwd'))}   [{m.get('status')}]")
+        return None, None
+    s = matches[0]
+    tty = _tty_of(s.get("pid"))
+    if not tty:
+        print(f"couldn't find the tty for {s.get('name')} (pid {s.get('pid')})")
+        return None, None
+    return s, tty
+
+
+def _osa(script, *args):
+    return subprocess.run(["osascript", "-", *args], input=script, capture_output=True, text=True).stdout
+
+
+# ---- spaces: leverage spacetag's CLI to switch to a session's Space ----
+
+def _spacetag_bin():
+    env = os.environ.get("CREW_SPACETAG")
+    if env:
+        return env
+    dev = os.path.expanduser(
+        "~/dev/spacetag/build/dd/Build/Products/Debug/spacetags-pro.app/Contents/MacOS/spacetags-pro")
+    return dev if os.path.exists(dev) else "/Applications/spacetags-pro.app/Contents/MacOS/spacetags-pro"
+
+
+def _spaces(source=None):
+    if source:
+        with open(source) as f:
+            return json.load(f)
+    try:
+        return json.loads(subprocess.run([_spacetag_bin(), "dump"], capture_output=True, text=True).stdout)
+    except Exception:
+        return []
+
+
+def _norm(s):
+    return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+
+def _aliases():
+    try:
+        return json.load(open(os.path.join(SNAP_DIR, "space_aliases.json")))
+    except Exception:
+        return {}
+
+
+def _space_for_session(s, spaces):
+    """Map a session to a tagged Space: alias file first, then tag-label match
+    (kaolin labels his Spaces by project, so this is usually exact)."""
+    cwd = s.get("cwd") or ""
+    projn, namen, cwdn = _norm(proj(cwd)), _norm(s.get("name")), _norm(cwd)
+    want = _aliases().get(proj(cwd)) or _aliases().get(s.get("name") or "")
+    if want is not None:
+        for sp in spaces:
+            if str(sp.get("index")) == str(want) or sp.get("uuid") == want or _norm(sp.get("tag")) == _norm(str(want)):
+                return sp
+    for sp in spaces:
+        tagn = _norm(sp.get("tag"))
+        if not tagn:
+            continue
+        if (projn and (projn in tagn or tagn in projn)) or (tagn in cwdn) or (namen and tagn in namen):
+            return sp
+    return None
+
+
+def cmd_peek(a):
+    s, tty = _pick(a.name)
+    if not s:
+        return
+    out = _osa(_OSA_PEEK, tty)
+    if "__NOTFOUND__" in out:
+        print(f"{s.get('name')} isn't in this iTerm2 (tty {tty}) — different terminal?")
+        return
+    lines = out.replace("\r", "\n").rstrip("\n").split("\n")
+    print(c("1", f"{s.get('name')}  [{s.get('status')}]  {proj(s.get('cwd'))}") + c("2", f"   {tty}"))
+    for ln in lines[-a.lines:]:
+        print("  " + ln)
+
+
+def cmd_tell(a):
+    s, tty = _pick(a.name)
+    if not s:
+        return
+    if s.get("status") == "busy" and not a.force:
+        print(f"{s.get('name')} is busy (mid-turn). --force to send anyway (it'll queue).")
+        return
+    out = _osa(_OSA_TELL, tty, a.message)
+    print(f"→ sent to {s.get('name')} ({proj(s.get('cwd'))})" if "__OK__" in out
+          else f"{s.get('name')} not found in iTerm2 (tty {tty})")
+
+
+def cmd_jump(a):
+    s, tty = _pick(a.name)
+    if not s:
+        return
+    sp = _space_for_session(s, _spaces())
+    if sp:
+        subprocess.run([_spacetag_bin(), "goto", str(sp["uuid"])])
+    out = _osa(_OSA_JUMP, tty)
+    where = f"  (Space {sp['index']} · {sp['tag']})" if sp else "  (no Space tag matched — same-Space select only)"
+    print(f"jumped to {s.get('name')}{where}" if "__OK__" in out
+          else f"{s.get('name')} not found in iTerm2 (tty {tty})")
+
+
+def cmd_goto(a):
+    sessions = load(a.source)
+    matches = _resolve(sessions, a.name)
+    if not matches:
+        print(f"no running session matches '{a.name}'")
+        return
+    if len(matches) > 1:
+        print(f"'{a.name}' is ambiguous — matches:")
+        for m in matches:
+            print(f"    {m.get('name')}   {proj(m.get('cwd'))}   [{m.get('status')}]")
+        return
+    s = matches[0]
+    spaces = _spaces(a.spaces_source)
+    if not spaces:
+        print("no Spaces from `spacetag dump` — is the pro build present? (set CREW_SPACETAG to override)")
+        return
+    sp = _space_for_session(s, spaces)
+    if not sp:
+        print(f"no Space tag matches {s.get('name')} ({proj(s.get('cwd'))}).")
+        print(f"add ~/.crew/space_aliases.json, e.g. {{\"{proj(s.get('cwd'))}\": \"<tag, index, or uuid>\"}}")
+        return
+    print(f"{s.get('name')} → Space {sp.get('index')} · {sp.get('tag')}")
+    if a.dry_run:
+        return
+    subprocess.run([_spacetag_bin(), "goto", str(sp["uuid"])])
+    tty = _tty_of(s.get("pid"))
+    if tty:
+        _osa(_OSA_JUMP, tty)
+
+
+# ---- setup / doctor: make crew self-installing (so it packages cleanly) ----
+
+def _plist_xml(crew_path):
+    log = os.path.join(SNAP_DIR, "snapshot.log")
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{PLIST_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>{crew_path} snapshot</string>
+  </array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict>
+</plist>
+'''
+
+
+def cmd_setup(a):
+    self_path = os.path.realpath(__file__)
+    link = os.path.expanduser("~/.local/bin/crew")
+    plist_path = os.path.expanduser(f"~/Library/LaunchAgents/{PLIST_LABEL}.plist")
+    if a.dry_run:
+        print(f"would symlink {link} -> {self_path}")
+        print(f"would write   {plist_path}  (from this exact path — portable)")
+        print(f"would load    {PLIST_LABEL} (snapshot every 300s)")
+        return
+    os.makedirs(os.path.dirname(link), exist_ok=True)
+    if os.path.lexists(link):
+        os.remove(link)
+    os.symlink(self_path, link)
+    print(f"linked  {link} -> {self_path}")
+    os.makedirs(os.path.dirname(plist_path), exist_ok=True)
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    with open(plist_path, "w") as f:
+        f.write(_plist_xml(self_path))
+    uid = os.getuid()
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{PLIST_LABEL}"], capture_output=True)
+    subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", plist_path], capture_output=True)
+    print(f"loaded  {PLIST_LABEL} (snapshot every 300s)\n")
+    cmd_doctor(a)
+
+
+def cmd_doctor(a):
+    def check(label, ok, detail=""):
+        mark = c("32", "✓") if ok else c("31", "✗")
+        print(f"  {mark} {label}" + (f"   {c('2', detail)}" if detail else ""))
+    print(c("1", "\n  crew doctor\n"))
+    cb = _claude_bin()
+    check("claude CLI", bool(shutil.which("claude")) or os.path.exists(cb), cb)
+    st = _spacetag_bin()
+    st_ok = bool(shutil.which("spacetag")) or os.path.exists(st)
+    check("spacetag (optional — Space restore)", st_ok, st if st_ok else "not found; spatial restore off")
+    check("iTerm2", os.environ.get("TERM_PROGRAM") == "iTerm.app" or os.path.exists("/Applications/iTerm.app"))
+    check("crew on PATH", os.path.lexists(os.path.expanduser("~/.local/bin/crew")))
+    uid = os.getuid()
+    loaded = subprocess.run(["launchctl", "print", f"gui/{uid}/{PLIST_LABEL}"], capture_output=True).returncode == 0
+    check("snapshot agent loaded", loaded, PLIST_LABEL)
+    print()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="crew", description="read-only status + restore for your Claude sessions")
+    ap.set_defaults(fn=cmd_status, source=None, all=False, go=False, out=None)
+    sub = ap.add_subparsers(dest="cmd")
+    ps = sub.add_parser("status", help="project-grouped status view (default)")
+    ps.add_argument("--source", help="read JSON from a file or '-' for stdin instead of `claude agents --json`")
+    ps.add_argument("--all", action="store_true", help="include completed sessions")
+    ps.set_defaults(fn=cmd_status)
+    pn = sub.add_parser("snapshot", help="save current sessions as a restore manifest")
+    pn.add_argument("--source")
+    pn.add_argument("--out", help=f"manifest path (default {SNAP_DIR}/latest.json)")
+    pn.add_argument("--force", action="store_true", help="write even an empty read (default: keep last good map)")
+    pn.add_argument("--spaces-source", dest="spaces_source", help="spaces JSON (testing; default: live `spacetag dump`)")
+    pn.set_defaults(fn=cmd_snapshot)
+    pr = sub.add_parser("restore", help="resume every session from a manifest into fresh iTerm2 windows")
+    pr.add_argument("--source", help=f"manifest path (default {SNAP_DIR}/latest.json)")
+    pr.add_argument("--go", action="store_true", help="actually open windows (default: dry-run)")
+    pr.set_defaults(fn=cmd_restore)
+    pk = sub.add_parser("peek", help="show the last screenful of a session (read-only)")
+    pk.add_argument("name")
+    pk.add_argument("--lines", type=int, default=40)
+    pk.set_defaults(fn=cmd_peek)
+    pt = sub.add_parser("tell", help="type a prompt into an idle session and submit it")
+    pt.add_argument("name")
+    pt.add_argument("message")
+    pt.add_argument("--force", action="store_true", help="send even if the session is busy")
+    pt.set_defaults(fn=cmd_tell)
+    pj = sub.add_parser("jump", help="switch to a session's Space (via spacetag) and front its window")
+    pj.add_argument("name")
+    pj.set_defaults(fn=cmd_jump)
+    pg = sub.add_parser("goto", help="switch to the Space a session lives on, then front it")
+    pg.add_argument("name")
+    pg.add_argument("--dry-run", action="store_true", help="print the resolved Space, don't switch")
+    pg.add_argument("--source", help="sessions JSON (testing)")
+    pg.add_argument("--spaces-source", dest="spaces_source", help="spaces JSON (testing)")
+    pg.set_defaults(fn=cmd_goto)
+    pu = sub.add_parser("setup", help="symlink crew onto PATH + install the snapshot agent")
+    pu.add_argument("--dry-run", action="store_true", help="print what it would do, change nothing")
+    pu.set_defaults(fn=cmd_setup)
+    ps2 = sub.add_parser("doctor", help="check deps (claude, spacetag, iTerm2, PATH, agent)")
+    ps2.set_defaults(fn=cmd_doctor)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
