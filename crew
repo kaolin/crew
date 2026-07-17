@@ -320,6 +320,52 @@ def _osa(script, *args):
     return subprocess.run(["osascript", "-", *args], input=script, capture_output=True, text=True).stdout
 
 
+# ---- dispatch adapters: how to peek / tell / jump / read-bounds for a session ----
+# Awareness (`claude agents --json`) is terminal-agnostic — it reports every session
+# regardless of the terminal it runs in. Only these four verbs are terminal-specific.
+# Each adapter maps a live tty to a terminal handle and acts in place. iTerm2 is the
+# only backend today; a tmux (or remote-over-ssh) backend drops in by implementing the
+# same four methods and teaching `adapter_for()` to route to it — nothing else changes.
+
+class ITerm2Adapter:
+    """Drive the live iTerm2 session behind a tty via AppleScript."""
+    name = "iTerm2"
+
+    def peek(self, tty):
+        """Return the session's on-screen contents, or None if not in this iTerm2."""
+        out = _osa(_OSA_PEEK, tty)
+        return None if "__NOTFOUND__" in out else out
+
+    def tell(self, tty, msg):
+        """Type + submit msg into the session. Returns True on success."""
+        return "__OK__" in _osa(_OSA_TELL, tty, msg)
+
+    def jump(self, tty):
+        """Front the session's window/tab/pane. Returns True on success."""
+        return "__OK__" in _osa(_OSA_JUMP, tty)
+
+    def bounds(self, tty):
+        """Return the window's (x, y, w, h) for Space matching, or None."""
+        out = _osa(_OSA_BOUNDS, tty).strip()
+        if "," not in out or "__NOTFOUND__" in out:
+            return None
+        try:
+            l, t, r, b = [int(float(v)) for v in out.split(",")[:4]]
+        except Exception:
+            return None
+        return (l, t, r - l, b - t)
+
+
+_ITERM2 = ITerm2Adapter()
+
+
+def adapter_for(tty):
+    """Pick the dispatch backend for a session's tty. iTerm2 today; a tmux backend
+    would check `_tmux_pane_of(tty)` here first and return a TmuxAdapter when the tty
+    belongs to a tmux pane, falling through to iTerm2 otherwise."""
+    return _ITERM2
+
+
 # ---- spaces: leverage spacetag's CLI to switch to a session's Space ----
 
 def _spacetag_bin():
@@ -411,14 +457,10 @@ def _window_space_for_session(s, tty, spaces, wins=None):
     Pass `wins` (a prefetched `spacetag windows` list) to avoid refetching per session."""
     if not tty:
         return None
-    out = _osa(_OSA_BOUNDS, tty).strip()
-    if "," not in out or "__NOTFOUND__" in out:
+    xywh = adapter_for(tty).bounds(tty)
+    if not xywh:
         return None
-    try:
-        l, t, r, b = [int(float(v)) for v in out.split(",")[:4]]
-    except Exception:
-        return None
-    x, y, w, h = l, t, r - l, b - t
+    x, y, w, h = xywh
     for win in (wins if wins is not None else _windows()):
         if (win.get("owner") or "") != "iTerm" or not win.get("space"):
             continue
@@ -431,9 +473,10 @@ def cmd_peek(a):
     s, tty = _pick(a.name)
     if not s:
         return
-    out = _osa(_OSA_PEEK, tty)
-    if "__NOTFOUND__" in out:
-        print(f"{s.get('name')} isn't in this iTerm2 (tty {tty}) — different terminal?")
+    ad = adapter_for(tty)
+    out = ad.peek(tty)
+    if out is None:
+        print(f"{s.get('name')} isn't reachable via {ad.name} (tty {tty}) — different terminal?")
         return
     lines = out.replace("\r", "\n").rstrip("\n").split("\n")
     print(c("1", f"{s.get('name')}  [{s.get('status')}]  {proj(s.get('cwd'))}") + c("2", f"   {tty}"))
@@ -448,9 +491,10 @@ def cmd_tell(a):
     if s.get("status") == "busy" and not a.force:
         print(f"{s.get('name')} is busy (mid-turn). --force to send anyway (it'll queue).")
         return
-    out = _osa(_OSA_TELL, tty, a.message)
-    print(f"→ sent to {s.get('name')} ({proj(s.get('cwd'))})" if "__OK__" in out
-          else f"{s.get('name')} not found in iTerm2 (tty {tty})")
+    ad = adapter_for(tty)
+    ok = ad.tell(tty, a.message)
+    print(f"→ sent to {s.get('name')} ({proj(s.get('cwd'))})" if ok
+          else f"{s.get('name')} not reachable via {ad.name} (tty {tty})")
 
 
 def cmd_jump(a):
@@ -462,15 +506,16 @@ def cmd_jump(a):
     sp = _window_space_for_session(s, tty, spaces) or _space_for_session(s, spaces)
     if sp and sp.get("uuid"):
         subprocess.run([_spacetag_bin(), "goto", str(sp["uuid"])])
-    out = _osa(_OSA_JUMP, tty)
+    ad = adapter_for(tty)
+    ok = ad.jump(tty)
     if sp and sp.get("index"):
         where = f"  (Space {sp['index']}" + (f" · {sp['tag']}" if sp.get("tag") else "") + ")"
     elif sp:
         where = "  (Space set)"
     else:
         where = "  (no Space match — same-Space select only)"
-    print(f"jumped to {s.get('name')}{where}" if "__OK__" in out
-          else f"{s.get('name')} not found in iTerm2 (tty {tty})")
+    print(f"jumped to {s.get('name')}{where}" if ok
+          else f"{s.get('name')} not reachable via {ad.name} (tty {tty})")
 
 
 def cmd_where(a):
@@ -519,7 +564,7 @@ def cmd_goto(a):
     subprocess.run([_spacetag_bin(), "goto", str(sp["uuid"])])
     tty = _tty_of(s.get("pid"))
     if tty:
-        _osa(_OSA_JUMP, tty)
+        adapter_for(tty).jump(tty)
 
 
 # ---- setup / doctor: make crew self-installing (so it packages cleanly) ----
