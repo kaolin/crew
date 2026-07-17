@@ -332,6 +332,61 @@ def _space_for_session(s, spaces):
     return None
 
 
+# ---- winspace: where a session's window ACTUALLY is (bounds match) ----
+
+_OSA_BOUNDS = """on run argv
+  set target to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (tty of s) is target then
+            set b to bounds of w
+            return ((item 1 of b) as string) & "," & ((item 2 of b) as string) & "," & ((item 3 of b) as string) & "," & ((item 4 of b) as string)
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "__NOTFOUND__"
+end run"""
+
+
+def _windows():
+    try:
+        return json.loads(subprocess.run([_spacetag_bin(), "windows"], capture_output=True, text=True).stdout)
+    except Exception:
+        return []
+
+
+def _tag_for(uuid, spaces):
+    for sp in (spaces or []):
+        if sp.get("uuid") == uuid:
+            return sp.get("tag")
+    return None
+
+
+def _window_space_for_session(s, tty, spaces):
+    """Where the session's iTerm2 window ACTUALLY is: read its bounds (AppleScript)
+    and match against `spacetag windows`. Handles untagged/home sessions, no config."""
+    if not tty:
+        return None
+    out = _osa(_OSA_BOUNDS, tty).strip()
+    if "," not in out or "__NOTFOUND__" in out:
+        return None
+    try:
+        l, t, r, b = [int(float(v)) for v in out.split(",")[:4]]
+    except Exception:
+        return None
+    x, y, w, h = l, t, r - l, b - t
+    for win in _windows():
+        if (win.get("owner") or "") != "iTerm" or not win.get("space"):
+            continue
+        if abs(win["x"] - x) <= 8 and abs(win["y"] - y) <= 8 and abs(win["w"] - w) <= 8 and abs(win["h"] - h) <= 8:
+            return {"uuid": win["space"], "index": win.get("spaceIndex"), "tag": _tag_for(win["space"], spaces)}
+    return None
+
+
 def cmd_peek(a):
     s, tty = _pick(a.name)
     if not s:
@@ -362,13 +417,39 @@ def cmd_jump(a):
     s, tty = _pick(a.name)
     if not s:
         return
-    sp = _space_for_session(s, _spaces())
-    if sp:
+    spaces = _spaces()
+    # Prefer where the window ACTUALLY is (winspace); fall back to its tagged home.
+    sp = _window_space_for_session(s, tty, spaces) or _space_for_session(s, spaces)
+    if sp and sp.get("uuid"):
         subprocess.run([_spacetag_bin(), "goto", str(sp["uuid"])])
     out = _osa(_OSA_JUMP, tty)
-    where = f"  (Space {sp['index']} · {sp['tag']})" if sp else "  (no Space tag matched — same-Space select only)"
+    if sp and sp.get("index"):
+        where = f"  (Space {sp['index']}" + (f" · {sp['tag']}" if sp.get("tag") else "") + ")"
+    elif sp:
+        where = "  (Space set)"
+    else:
+        where = "  (no Space match — same-Space select only)"
     print(f"jumped to {s.get('name')}{where}" if "__OK__" in out
           else f"{s.get('name')} not found in iTerm2 (tty {tty})")
+
+
+def cmd_where(a):
+    s, tty = _pick(a.name)
+    if not s:
+        return
+    spaces = _spaces()
+    actual = _window_space_for_session(s, tty, spaces)
+    intended = _space_for_session(s, spaces)
+
+    def fmt(sp):
+        if not sp:
+            return c("2", "—")
+        return f"Space {sp.get('index')}" + (f" · {sp['tag']}" if sp.get("tag") else "")
+
+    print(c("1", f"\n  {s.get('name')}   ({proj(s.get('cwd'))})\n"))
+    print(f"  actual    (window is on)   {fmt(actual)}")
+    print(f"  intended  (tag mapping)    {fmt(intended)}")
+    print()
 
 
 def cmd_goto(a):
@@ -504,6 +585,9 @@ def main():
     pg.add_argument("--source", help="sessions JSON (testing)")
     pg.add_argument("--spaces-source", dest="spaces_source", help="spaces JSON (testing)")
     pg.set_defaults(fn=cmd_goto)
+    pw = sub.add_parser("where", help="show where a session's window actually is vs its tagged home")
+    pw.add_argument("name")
+    pw.set_defaults(fn=cmd_where)
     pu = sub.add_parser("setup", help="symlink crew onto PATH + install the snapshot agent")
     pu.add_argument("--dry-run", action="store_true", help="print what it would do, change nothing")
     pu.set_defaults(fn=cmd_setup)

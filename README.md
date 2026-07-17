@@ -34,7 +34,9 @@ macOS + iTerm2; uses the `claude` CLI (Claude Code).
 | `crew` · `crew status` | fleet overview, grouped by project, needs-you first |
 | `crew peek <name>` | read a session's screen (read-only) |
 | `crew tell <name> "…"` | send a prompt to an **idle** session (refuses `busy` w/o `--force`) |
-| `crew jump <name>` · `goto <name>` | switch to its Space + front its window |
+| `crew jump <name>` | go to where its window *actually* is (+ front it) |
+| `crew goto <name>` | go to its *tagged* (intended) Space |
+| `crew where <name>` | show actual Space vs. tagged home |
 | `crew snapshot` · `crew restore` | save / rebuild the whole layout across a reboot |
 | `crew setup` · `crew doctor` | install onto PATH + agent / health-check |
 
