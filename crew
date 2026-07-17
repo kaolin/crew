@@ -121,8 +121,10 @@ def cmd_snapshot(a):
     spaces = _spaces(a.spaces_source)
     # Record where each window ACTUALLY is (winspace) so restore rebuilds the real
     # layout, incl. untagged sessions; fall back to the tagged home. `spacetag windows`
-    # is fetched once and shared. Skip winspace in test mode (--spaces-source given).
-    wins = _windows() if (spaces and not a.spaces_source) else None
+    # is fetched once and shared. Skip live probes (winspace, launch-flag capture) in
+    # test mode (--source given → fixture sessions with non-live pids).
+    testmode = bool(a.source)
+    wins = _windows() if (spaces and not testmode) else None
     manifest = []
     for s in sessions:
         tty = _tty_of(s.get("pid")) if wins else None
@@ -131,6 +133,7 @@ def cmd_snapshot(a):
         manifest.append({
             "cwd": s.get("cwd"), "sessionId": s.get("sessionId"),
             "name": s.get("name"), "status": s.get("status"),
+            "launchArgs": [] if testmode else _launch_flags(s.get("pid")),
             "space": sp.get("uuid") if sp else None,
             "spaceIndex": sp.get("index") if sp else None,
             "spaceTag": sp.get("tag") if sp else None,
@@ -167,7 +170,8 @@ def cmd_restore(a):
             continue
         space = s.get("space")
         where = f"Space {s.get('spaceIndex')} · {s.get('spaceTag')}" if space else "current Space"
-        resume = f"cd {shq(cwd)} && claude --resume {sid}"
+        flagstr = "".join(" " + shq(f) for f in (s.get("launchArgs") or []))
+        resume = f"cd {shq(cwd)} && claude{flagstr} --resume {sid}"
         if a.go:
             if space:
                 subprocess.run([_spacetag_bin(), "goto", str(space)])  # land the new window on its Space
@@ -208,6 +212,35 @@ def _tty_of(pid):
         return None
     out = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return None if not out or out == "??" else "/dev/" + out
+
+
+def _parse_flags(args):
+    """From a `ps args` line ('claude --dangerously-skip-permissions --resume X'),
+    return the launch flags worth replaying — minus resume/continue/print/bg, since
+    restore re-adds its own --resume."""
+    toks = args.split()
+    if toks and not toks[0].startswith("-"):
+        toks = toks[1:]  # drop the executable (claude / full path)
+    drop = {"--resume", "-r", "--continue", "-c", "--fork-session", "--from-pr",
+            "--print", "-p", "--bg", "--background"}
+    takes_val = {"--resume", "-r", "--from-pr"}
+    out, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t in drop:
+            i += 2 if (t in takes_val and i + 1 < len(toks) and not toks[i + 1].startswith("-")) else 1
+            continue
+        out.append(t)
+        i += 1
+    return out
+
+
+def _launch_flags(pid):
+    """Recover a running claude's launch flags so restore replays --dangerously-skip-permissions, --model, etc."""
+    if not pid:
+        return []
+    args = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return _parse_flags(args) if args else []
 
 
 # AppleScript takes (tty[, msg]) via `on run argv`, so we never string-escape into the script body.

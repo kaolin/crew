@@ -53,6 +53,17 @@ empty=$(mktemp); echo '[]' > "$empty"
 [[ $(python3 -c "import json;print(len(json.load(open('$keep'))))") == 5 ]] || fail "good map lost after empty snapshot"
 rm -f "$keep" "$empty"
 
+echo "== launch-flag capture keeps yolo, drops resume =="
+python3 -c "
+from importlib.machinery import SourceFileLoader
+from importlib.util import spec_from_loader, module_from_spec
+l=SourceFileLoader('crewmod','./crew'); m=module_from_spec(spec_from_loader('crewmod',l)); l.exec_module(m)
+assert m._parse_flags('claude --dangerously-skip-permissions --resume abc')==['--dangerously-skip-permissions'], 'bare-value'
+assert m._parse_flags('claude --dangerously-skip-permissions --resume')==['--dangerously-skip-permissions'], 'trailing-resume'
+assert m._parse_flags('claude --model claude-opus-4-8 --dangerously-skip-permissions --resume x')==['--model','claude-opus-4-8','--dangerously-skip-permissions'], 'value-flag'
+print('  parsing OK')
+" || fail "launch-flag parsing wrong"
+
 echo "== doctor runs; setup --dry-run changes nothing =="
 ./crew doctor >/dev/null || fail "doctor errored"
 sdry=$(./crew setup --dry-run)
