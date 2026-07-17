@@ -119,9 +119,15 @@ def cmd_snapshot(a):
     os.makedirs(SNAP_DIR, exist_ok=True)
     path = a.out or os.path.join(SNAP_DIR, "latest.json")
     spaces = _spaces(a.spaces_source)
+    # Record where each window ACTUALLY is (winspace) so restore rebuilds the real
+    # layout, incl. untagged sessions; fall back to the tagged home. `spacetag windows`
+    # is fetched once and shared. Skip winspace in test mode (--spaces-source given).
+    wins = _windows() if (spaces and not a.spaces_source) else None
     manifest = []
     for s in sessions:
-        sp = _space_for_session(s, spaces) if spaces else None
+        tty = _tty_of(s.get("pid")) if wins else None
+        sp = (_window_space_for_session(s, tty, spaces, wins) if wins else None) \
+            or (_space_for_session(s, spaces) if spaces else None)
         manifest.append({
             "cwd": s.get("cwd"), "sessionId": s.get("sessionId"),
             "name": s.get("name"), "status": s.get("status"),
@@ -366,9 +372,10 @@ def _tag_for(uuid, spaces):
     return None
 
 
-def _window_space_for_session(s, tty, spaces):
+def _window_space_for_session(s, tty, spaces, wins=None):
     """Where the session's iTerm2 window ACTUALLY is: read its bounds (AppleScript)
-    and match against `spacetag windows`. Handles untagged/home sessions, no config."""
+    and match against `spacetag windows`. Handles untagged/home sessions, no config.
+    Pass `wins` (a prefetched `spacetag windows` list) to avoid refetching per session."""
     if not tty:
         return None
     out = _osa(_OSA_BOUNDS, tty).strip()
@@ -379,7 +386,7 @@ def _window_space_for_session(s, tty, spaces):
     except Exception:
         return None
     x, y, w, h = l, t, r - l, b - t
-    for win in _windows():
+    for win in (wins if wins is not None else _windows()):
         if (win.get("owner") or "") != "iTerm" or not win.get("space"):
             continue
         if abs(win["x"] - x) <= 8 and abs(win["y"] - y) <= 8 and abs(win["w"] - w) <= 8 and abs(win["h"] - h) <= 8:
