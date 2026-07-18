@@ -540,19 +540,120 @@ def _window_space_for_session(s, tty, spaces, wins=None):
     return None
 
 
+# ---- transcript: read a session's conversation from its JSONL (terminal-agnostic) ----
+
+def _jsonl_path(s):
+    enc = (s.get("cwd") or "").replace("/", "-")
+    return os.path.join(HOME, ".claude", "projects", enc, (s.get("sessionId") or "") + ".jsonl")
+
+
+def _msg_text(r):
+    c = r.get("message", {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = []
+        for b in c:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                parts.append(b.get("text", ""))
+            elif b.get("type") == "tool_use":
+                parts.append(f"[{b.get('name', 'tool')}]")
+        return "\n".join(p for p in parts if p.strip())
+    return ""
+
+
+def _parse_turns(lines):
+    turns = []
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+        except Exception:
+            continue
+        if r.get("type") in ("user", "assistant"):
+            t = _msg_text(r).strip()
+            if t:
+                turns.append((r["type"], t))
+    return turns
+
+
+def _read_turns(s):
+    """All (role, text) turns from the session's JSONL, in order. [] if unreadable."""
+    try:
+        with open(_jsonl_path(s), errors="ignore") as f:
+            return _parse_turns(f)
+    except Exception:
+        return []
+
+
+def _jsonl_lines(s):
+    try:
+        with open(_jsonl_path(s), "rb") as f:
+            return sum(1 for _ in f)
+    except Exception:
+        return 0
+
+
+def _assistant_since(s, before_lines):
+    """Assistant messages that appear after line `before_lines` — i.e. the reply to a
+    just-sent prompt."""
+    out = []
+    try:
+        with open(_jsonl_path(s), errors="ignore") as f:
+            for i, ln in enumerate(f):
+                if i < before_lines:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except Exception:
+                    continue
+                if r.get("type") == "assistant":
+                    t = _msg_text(r).strip()
+                    if t:
+                        out.append(t)
+    except Exception:
+        pass
+    return out
+
+
+def _session_now(sid):
+    """Refetch one session's live record from `claude agents --json` (for polling)."""
+    try:
+        for x in load(include_all=True):
+            if x.get("sessionId") == sid:
+                return x
+    except Exception:
+        pass
+    return None
+
+
 def cmd_peek(a):
     s, tty = _pick(a.name)
     if not s:
         return
-    ad = adapter_for(tty)
-    out = ad.peek(tty)
-    if out is None:
-        print(f"{s.get('name')} isn't reachable via {ad.name} (tty {tty}) — different terminal?")
+    hdr = c("1", f"{s.get('name')}  [{s.get('status')}]  {proj(s.get('cwd'))}")
+    if s.get("waitingFor"):
+        hdr += c("33", f"   ⟵ {s['waitingFor']}")
+    if a.screen:  # raw terminal scrape — the live TUI (needs a drivable adapter)
+        ad = adapter_for(tty)
+        out = ad.peek(tty)
+        if out is None:
+            print(f"{s.get('name')} isn't reachable via {ad.name} (tty {tty}) — different terminal?")
+            return
+        print(hdr + c("2", f"   {tty}"))
+        for ln in out.replace("\r", "\n").rstrip("\n").split("\n")[-a.lines:]:
+            print("  " + ln)
         return
-    lines = out.replace("\r", "\n").rstrip("\n").split("\n")
-    print(c("1", f"{s.get('name')}  [{s.get('status')}]  {proj(s.get('cwd'))}") + c("2", f"   {tty}"))
-    for ln in lines[-a.lines:]:
-        print("  " + ln)
+    # default: the conversation, from the transcript (fast, works for ANY terminal)
+    turns = _read_turns(s)[-a.turns:]
+    print(hdr)
+    for role, text in turns:
+        who = c("36", "you ›") if role == "user" else c("32", "claude ›")
+        body = text if len(text) <= 700 else text[:700] + c("2", " …")
+        print(f"  {who} {body}\n")
+    if not turns:
+        print(c("2", "  (no transcript)"))
 
 
 def cmd_tell(a):
@@ -566,6 +667,49 @@ def cmd_tell(a):
     ok = ad.tell(tty, a.message)
     print(f"→ sent to {s.get('name')} ({proj(s.get('cwd'))})" if ok
           else f"{s.get('name')} not reachable via {ad.name} (tty {tty})")
+
+
+def cmd_ask(a):
+    """Send a prompt and wait for the reply — a synchronous round-trip to a session."""
+    s, tty = _pick(a.name)
+    if not s:
+        return
+    if s.get("status") == "busy" and not a.force:
+        print(f"{s.get('name')} is busy (mid-turn). --force to queue behind its current turn.")
+        return
+    ad = adapter_for(tty)
+    before = _jsonl_lines(s)
+    if not ad.tell(tty, a.message):
+        print(f"couldn't send to {s.get('name')} via {ad.name} (tty {tty})")
+        return
+    print(c("2", f"→ asked {s.get('name')}; waiting for the reply (Ctrl-C to stop)…"))
+    sid = s.get("sessionId")
+    deadline = time.time() + a.timeout
+    active, quiet, last = False, 0, before
+    while time.time() < deadline:
+        time.sleep(1.5)
+        live = _session_now(sid) or {}
+        st, wf = live.get("status"), live.get("waitingFor")
+        lines = _jsonl_lines(s)
+        if st == "waiting" and wf:
+            print(c("33", f"⚠ {s.get('name')} is now waiting on: {wf} — stopping here."))
+            break
+        if st == "busy" or lines > last:
+            active, quiet = True, 0
+        elif active and st in ("idle", "waiting", "completed"):
+            quiet += 1
+            if quiet >= 2:            # settled: idle + no new output for ~3s
+                break
+        last = lines
+    else:
+        print(c("33", f"⚠ timed out after {a.timeout}s — reply so far:"))
+    replies = _assistant_since(s, before)
+    print(c("1", f"\n{s.get('name')} ›"))
+    if replies:
+        body = "\n".join(replies)
+        print("  " + (body if len(body) <= 2000 else body[:2000] + c("2", " …")).replace("\n", "\n  "))
+    else:
+        print(c("2", "  (no reply captured yet — try `crew peek` in a moment)"))
 
 
 def cmd_jump(a):
@@ -723,15 +867,23 @@ def main():
     pr.add_argument("--source", help=f"manifest path (default {SNAP_DIR}/latest.json)")
     pr.add_argument("--go", action="store_true", help="actually open windows (default: dry-run)")
     pr.set_defaults(fn=cmd_restore)
-    pk = sub.add_parser("peek", help="show the last screenful of a session (read-only)")
+    pk = sub.add_parser("peek", help="show a session's recent conversation (read-only, any terminal)")
     pk.add_argument("name")
-    pk.add_argument("--lines", type=int, default=40)
+    pk.add_argument("--turns", type=int, default=4, help="recent turns to show (transcript mode)")
+    pk.add_argument("--screen", action="store_true", help="raw terminal scrape instead of the transcript")
+    pk.add_argument("--lines", type=int, default=40, help="lines to show with --screen")
     pk.set_defaults(fn=cmd_peek)
-    pt = sub.add_parser("tell", help="type a prompt into an idle session and submit it")
+    pt = sub.add_parser("tell", help="type a prompt into an idle session and submit it (fire-and-forget)")
     pt.add_argument("name")
     pt.add_argument("message")
     pt.add_argument("--force", action="store_true", help="send even if the session is busy")
     pt.set_defaults(fn=cmd_tell)
+    pa = sub.add_parser("ask", help="send a prompt and WAIT for the reply (synchronous round-trip)")
+    pa.add_argument("name")
+    pa.add_argument("message")
+    pa.add_argument("--force", action="store_true", help="ask even if the session is busy")
+    pa.add_argument("--timeout", type=int, default=300, help="seconds to wait for the reply")
+    pa.set_defaults(fn=cmd_ask)
     pj = sub.add_parser("jump", help="switch to a session's Space (via spacetag) and front its window")
     pj.add_argument("name")
     pj.set_defaults(fn=cmd_jump)

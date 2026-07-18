@@ -76,6 +76,22 @@ assert m.TmuxAdapter('foo','0:0.0').name=='tmux'
 print('  tmux adapter logic OK')
 " || fail "tmux adapter logic wrong"
 
+echo "== transcript parsing =="
+python3 -c "
+from importlib.machinery import SourceFileLoader
+from importlib.util import spec_from_loader, module_from_spec
+import json
+l=SourceFileLoader('crewmod','./crew'); m=module_from_spec(spec_from_loader('crewmod',l)); l.exec_module(m)
+assert m._msg_text({'message':{'content':'hi'}})=='hi'
+assert m._msg_text({'message':{'content':[{'type':'text','text':'a'},{'type':'tool_use','name':'Bash'},{'type':'text','text':'b'}]}})=='a\n[Bash]\nb'
+lines=[json.dumps({'type':'user','message':{'content':'q1'}}),
+       json.dumps({'type':'assistant','message':{'content':[{'type':'text','text':'r1'}]}}),
+       'garbage-line',
+       json.dumps({'type':'system','message':{'content':'ignore me'}})]
+assert m._parse_turns(lines)==[('user','q1'),('assistant','r1')], m._parse_turns(lines)
+print('  transcript parsing OK')
+" || fail "transcript parsing wrong"
+
 echo "== doctor runs; setup --dry-run changes nothing =="
 ./crew doctor >/dev/null || fail "doctor errored"
 sdry=$(./crew setup --dry-run)

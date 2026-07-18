@@ -32,8 +32,9 @@ macOS + iTerm2; uses the `claude` CLI (Claude Code).
 | command | what it does |
 |---|---|
 | `crew` · `crew status` | fleet overview, grouped by project, needs-you first |
-| `crew peek <name>` | read a session's screen (read-only) |
-| `crew tell <name> "…"` | send a prompt to an **idle** session (refuses `busy` w/o `--force`) |
+| `crew peek <name>` | read a session's recent conversation (any terminal; `--screen` for raw TUI) |
+| `crew ask <name> "…"` | send a prompt and **wait for the reply** (round-trip) |
+| `crew tell <name> "…"` | fire-and-forget a prompt to an **idle** session |
 | `crew jump <name>` | go to where its window *actually* is (+ front it) |
 | `crew goto <name>` | go to its *tagged* (intended) Space |
 | `crew where <name>` | show actual Space vs. tagged home |
