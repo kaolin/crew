@@ -92,6 +92,17 @@ assert m._parse_turns(lines)==[('user','q1'),('assistant','r1')], m._parse_turns
 print('  transcript parsing OK')
 " || fail "transcript parsing wrong"
 
+echo "== artifact URL extraction =="
+python3 -c "
+from importlib.machinery import SourceFileLoader
+from importlib.util import spec_from_loader, module_from_spec
+l=SourceFileLoader('crewmod','./crew'); m=module_from_spec(spec_from_loader('crewmod',l)); l.exec_module(m)
+t='live https://claude.ai/code/artifact/f158d9ff-4b21-44bb-acb6-6a6aa050b8f1** and (https://claude.ai/public/artifacts/b4b147bd-fbd0-412c-a29d-9f6c39ed47f5) but not https://claude.ai/code/artifact/abc123'
+assert m._artifact_urls(t)==['https://claude.ai/code/artifact/f158d9ff-4b21-44bb-acb6-6a6aa050b8f1','https://claude.ai/public/artifacts/b4b147bd-fbd0-412c-a29d-9f6c39ed47f5'], m._artifact_urls(t)
+assert m._artifact_urls('no links here')==[]
+print('  artifact extraction OK')
+" || fail "artifact extraction wrong"
+
 echo "== doctor runs; setup --dry-run changes nothing =="
 ./crew doctor >/dev/null || fail "doctor errored"
 sdry=$(./crew setup --dry-run)

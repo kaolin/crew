@@ -13,7 +13,7 @@ Subcommands:
 
 stdlib only — no pip/conda env needed.
 """
-import sys, os, json, time, subprocess, argparse, shutil
+import sys, os, json, time, subprocess, argparse, shutil, re
 
 HOME = os.path.expanduser("~")
 SNAP_DIR = os.path.join(HOME, ".crew")
@@ -629,6 +629,37 @@ def _session_now(sid):
     return None
 
 
+_ARTIFACT_RE = re.compile(
+    r"https://claude\.ai/[a-z/]*artifacts?/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def _artifact_urls(text):
+    return _ARTIFACT_RE.findall(text or "")
+
+
+def cmd_artifacts(a):
+    """A gallery of every live artifact URL your fleet has published (from transcripts)."""
+    found = False
+    for s in load(include_all=a.all):
+        seen, urls = set(), []
+        try:
+            with open(_jsonl_path(s), errors="ignore") as f:
+                for ln in f:
+                    for u in _artifact_urls(ln):
+                        if u not in seen:
+                            seen.add(u)
+                            urls.append(u)
+        except Exception:
+            continue
+        if not urls:
+            continue
+        found = True
+        print(c("1", f"\n  {s.get('name')}") + c("2", f"  ({proj(s.get('cwd'))})"))
+        for u in urls[-a.limit:]:
+            print("    " + u)
+    print() if found else print("no artifacts found in any live session transcript.")
+
+
 def cmd_peek(a):
     s, tty = _pick(a.name)
     if not s:
@@ -858,6 +889,10 @@ def main():
     ps.add_argument("--source", help="read JSON from a file or '-' for stdin instead of `claude agents --json`")
     ps.add_argument("--all", action="store_true", help="include completed sessions")
     ps.set_defaults(fn=cmd_status)
+    par = sub.add_parser("artifacts", help="gallery of every live artifact URL across your fleet")
+    par.add_argument("--all", action="store_true", help="include completed sessions")
+    par.add_argument("--limit", type=int, default=5, help="max artifacts per session")
+    par.set_defaults(fn=cmd_artifacts)
     pn = sub.add_parser("snapshot", help="save current sessions as a restore manifest")
     pn.add_argument("--source")
     pn.add_argument("--out", help=f"manifest path (default {SNAP_DIR}/latest.json)")

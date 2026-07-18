@@ -32,6 +32,7 @@ macOS + iTerm2; uses the `claude` CLI (Claude Code).
 | command | what it does |
 |---|---|
 | `crew` · `crew status` | fleet overview, grouped by project, needs-you first |
+| `crew artifacts` | gallery of every live artifact URL your fleet has published |
 | `crew peek <name>` | read a session's recent conversation (any terminal; `--screen` for raw TUI) |
 | `crew ask <name> "…"` | send a prompt and **wait for the reply** (round-trip) |
 | `crew tell <name> "…"` | fire-and-forget a prompt to an **idle** session |
