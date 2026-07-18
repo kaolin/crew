@@ -64,6 +64,18 @@ assert m._parse_flags('claude --model claude-opus-4-8 --dangerously-skip-permiss
 print('  parsing OK')
 " || fail "launch-flag parsing wrong"
 
+echo "== tmux pane parsing + adapter routing =="
+python3 -c "
+from importlib.machinery import SourceFileLoader
+from importlib.util import spec_from_loader, module_from_spec
+l=SourceFileLoader('crewmod','./crew'); m=module_from_spec(spec_from_loader('crewmod',l)); l.exec_module(m)
+p=m._parse_panes('foo','/dev/ttys021\t0:0.0\n/dev/ttys099\twork:1.2\ngarbage-line')
+assert p=={'/dev/ttys021':('foo','0:0.0'),'/dev/ttys099':('foo','work:1.2')}, p
+assert m.TmuxAdapter('foo','0:0.0').bounds('/dev/ttys021') is None
+assert m.TmuxAdapter('foo','0:0.0').name=='tmux'
+print('  tmux adapter logic OK')
+" || fail "tmux adapter logic wrong"
+
 echo "== doctor runs; setup --dry-run changes nothing =="
 ./crew doctor >/dev/null || fail "doctor errored"
 sdry=$(./crew setup --dry-run)

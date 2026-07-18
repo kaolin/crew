@@ -359,11 +359,82 @@ class ITerm2Adapter:
 _ITERM2 = ITerm2Adapter()
 
 
+class TmuxAdapter:
+    """Drive a claude running inside a tmux pane (any socket) via tmux itself.
+    Bound to a resolved (socket, target); `adapter_for` builds one per tmux tty."""
+    name = "tmux"
+
+    def __init__(self, socket, target):
+        self.socket, self.target = socket, target
+
+    def _tmux(self, *args):
+        return subprocess.run(["tmux", "-L", self.socket, *args], capture_output=True, text=True)
+
+    def peek(self, tty):
+        r = self._tmux("capture-pane", "-t", self.target, "-p")
+        return r.stdout if r.returncode == 0 else None
+
+    def tell(self, tty, msg):
+        self._tmux("send-keys", "-t", self.target, "-l", msg)   # literal text, then submit
+        return self._tmux("send-keys", "-t", self.target, "Enter").returncode == 0
+
+    def jump(self, tty):
+        # select the pane within tmux (can't front the attached GUI terminal window)
+        self._tmux("select-window", "-t", self.target)
+        return self._tmux("select-pane", "-t", self.target).returncode == 0
+
+    def bounds(self, tty):
+        return None  # a tmux pane has no window bounds — winspace falls back to tag-map
+
+
+_TMUX_CACHE = None
+
+
+def _parse_panes(sock, text):
+    out = {}
+    for line in text.splitlines():
+        if "\t" in line:
+            ptty, target = line.split("\t", 1)
+            out[ptty] = (sock, target)
+    return out
+
+
+def _tmux_panes():
+    """Map every tmux pane's tty -> (socket, target) across all live sockets (cached
+    per run). Robust to no tmux, dead/stale sockets, and a bare launchd PATH."""
+    global _TMUX_CACHE
+    if _TMUX_CACHE is not None:
+        return _TMUX_CACHE
+    out, tmuxbin = {}, shutil.which("tmux")
+    sockdir = os.environ.get("TMUX_TMPDIR") or f"/tmp/tmux-{os.getuid()}"
+    if tmuxbin:
+        try:
+            socks = os.listdir(sockdir)
+        except Exception:
+            socks = []
+        for sock in socks:
+            try:
+                r = subprocess.run(
+                    [tmuxbin, "-L", sock, "list-panes", "-a", "-F",
+                     "#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}"],
+                    capture_output=True, text=True)
+            except Exception:
+                continue
+            if r.returncode == 0:
+                out.update(_parse_panes(sock, r.stdout))
+    _TMUX_CACHE = out
+    return out
+
+
+def _tmux_pane_of(tty):
+    return _tmux_panes().get(tty)
+
+
 def adapter_for(tty):
-    """Pick the dispatch backend for a session's tty. iTerm2 today; a tmux backend
-    would check `_tmux_pane_of(tty)` here first and return a TmuxAdapter when the tty
-    belongs to a tmux pane, falling through to iTerm2 otherwise."""
-    return _ITERM2
+    """Pick the dispatch backend for a session's tty: a TmuxAdapter when the tty
+    belongs to a tmux pane (any socket), else iTerm2."""
+    pane = _tmux_pane_of(tty)
+    return TmuxAdapter(*pane) if pane else _ITERM2
 
 
 # ---- spaces: leverage spacetag's CLI to switch to a session's Space ----
