@@ -76,6 +76,25 @@ assert m.TmuxAdapter('foo','0:0.0').name=='tmux'
 print('  tmux adapter logic OK')
 " || fail "tmux adapter logic wrong"
 
+echo "== tmux tell: bracketed paste for multi-line, send-keys for single =="
+python3 -c "
+from importlib.machinery import SourceFileLoader
+from importlib.util import spec_from_loader, module_from_spec
+l=SourceFileLoader('crewmod','./crew'); m=module_from_spec(spec_from_loader('crewmod',l)); l.exec_module(m)
+m.time.sleep=lambda *a: None
+class R: returncode=0
+a=m.TmuxAdapter('foo','0:0.0'); calls=[]
+a._tmux=lambda *args: (calls.append(args), R())[1]
+a.tell('/dev/ttys021','one line')
+assert any(c[0]=='send-keys' and '-l' in c for c in calls), calls
+assert not any(c[0]=='paste-buffer' for c in calls), calls
+calls.clear()
+a.tell('/dev/ttys021','line1\nline2\nline3')
+assert any(c[0]=='set-buffer' for c in calls) and any(c[0]=='paste-buffer' for c in calls), calls
+assert any(c[0]=='send-keys' and c[-1]=='Enter' for c in calls), calls
+print('  tmux tell branching OK')
+" || fail "tmux tell branching wrong"
+
 echo "== transcript parsing =="
 python3 -c "
 from importlib.machinery import SourceFileLoader

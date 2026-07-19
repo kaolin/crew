@@ -258,7 +258,11 @@ _OSA_PEEK = """on run argv
   return "__NOTFOUND__"
 end run"""
 
-_OSA_TELL = """on run argv
+# Typing and submitting are two separate scripts: a lone CR sent right after a
+# multi-line `write text` gets swallowed by the terminal's bracketed-paste
+# accumulation instead of submitting, so the adapter types, lets a multi-line
+# paste settle, then sends the Enter as a distinct keystroke.
+_OSA_TYPE = """on run argv
   set target to item 1 of argv
   set msg to item 2 of argv
   tell application "iTerm2"
@@ -267,6 +271,22 @@ _OSA_TELL = """on run argv
         repeat with s in sessions of t
           if (tty of s) is target then
             tell s to write text msg newline no
+            return "__OK__"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "__NOTFOUND__"
+end run"""
+
+_OSA_SUBMIT = """on run argv
+  set target to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (tty of s) is target then
             tell s to write text (character id 13) newline no
             return "__OK__"
           end if
@@ -338,8 +358,13 @@ class ITerm2Adapter:
         return None if "__NOTFOUND__" in out else out
 
     def tell(self, tty, msg):
-        """Type + submit msg into the session. Returns True on success."""
-        return "__OK__" in _osa(_OSA_TELL, tty, msg)
+        """Type + submit msg into the session. For multi-line msg, let the paste
+        settle before the Enter so it isn't swallowed by bracketed paste."""
+        if "__OK__" not in _osa(_OSA_TYPE, tty, msg):
+            return False
+        if "\n" in msg:
+            time.sleep(0.6)
+        return "__OK__" in _osa(_OSA_SUBMIT, tty)
 
     def jump(self, tty):
         """Front the session's window/tab/pane. Returns True on success."""
@@ -376,7 +401,14 @@ class TmuxAdapter:
         return r.stdout if r.returncode == 0 else None
 
     def tell(self, tty, msg):
-        self._tmux("send-keys", "-t", self.target, "-l", msg)   # literal text, then submit
+        if "\n" in msg:
+            # bracketed paste so the TUI takes it as one paste, not line-by-line
+            # (raw newlines via send-keys -l can submit early); settle, then Enter.
+            self._tmux("set-buffer", "-b", "crew_tell", msg)
+            self._tmux("paste-buffer", "-d", "-p", "-b", "crew_tell", "-t", self.target)
+            time.sleep(0.6)
+        else:
+            self._tmux("send-keys", "-t", self.target, "-l", msg)   # literal text, then submit
         return self._tmux("send-keys", "-t", self.target, "Enter").returncode == 0
 
     def jump(self, tty):
