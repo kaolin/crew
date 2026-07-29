@@ -13,11 +13,20 @@ Subcommands:
 
 stdlib only — no pip/conda env needed.
 """
-import sys, os, json, time, subprocess, argparse, shutil, re
+import sys, os, json, time, subprocess, argparse, shutil, re, calendar
 
 HOME = os.path.expanduser("~")
 SNAP_DIR = os.path.join(HOME, ".crew")
 PLIST_LABEL = "com.kaolin.crew-snapshot"
+
+# Telegram "actioned" tracking. Splits "the server DELIVERED it" (inbound.cursor,
+# owned by the telegram plugin) from "the hub actually RELAYED/handled it"
+# (actioned.cursor, owned here) — so a fresh hub can catch up on what a dead or
+# context-dropped hub missed. See hub-protocol.md "Never miss a message".
+TG_DIR           = os.path.join(HOME, ".claude", "channels", "telegram")
+TG_INBOUND       = os.path.join(TG_DIR, "inbound.jsonl")
+TG_ACTIONED      = os.path.join(TG_DIR, "actioned.cursor")
+TG_REVIEW_WINDOW = 48 * 3600   # tg-unactioned ignores records older than this unless --all
 
 # lower rank = more urgent / sorts first
 STATUS_RANK = {"waiting": 0, "busy": 1, "idle": 2, "completed": 3, "stopped": 4, "failed": 5}
@@ -913,6 +922,88 @@ def cmd_doctor(a):
     print()
 
 
+def _tg_records():
+    recs = []
+    try:
+        with open(TG_INBOUND, errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    recs.append(json.loads(line))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return recs
+
+
+def _tg_actioned_cursor():
+    try:
+        return int(open(TG_ACTIONED).read().strip() or "0")
+    except (OSError, ValueError):
+        return 0
+
+
+def _tg_maxseq(recs):
+    return max((r.get("seq", 0) for r in recs), default=0)
+
+
+def cmd_tg_unactioned(a):
+    """Telegram inbound that was logged but not yet confirmed ACTIONED by the hub
+    (seq > actioned.cursor). This is the catch-up list a fresh hub reviews so no
+    message silently goes unaddressed across a restart/drop."""
+    recs = _tg_records()
+    cur = _tg_actioned_cursor()
+    now = time.time()
+    rows = []
+    for r in recs:
+        if r.get("seq", 0) <= cur:
+            continue
+        try:
+            ep = calendar.timegm(time.strptime((r.get("ts") or "")[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            ep = now
+        if not getattr(a, "all", False) and now - ep > TG_REVIEW_WINDOW:
+            continue
+        p = r.get("params", {}) or {}
+        meta = p.get("meta", {}) or {}
+        content = (p.get("content") or "").replace("\n", " ")
+        extra = ""
+        if meta.get("image_path"):
+            extra += f"  [image: {meta['image_path']}]"
+        if meta.get("attachment_file_id"):
+            extra += "  [attachment]"
+        rows.append(f"  seq {r['seq']}  msg_id {meta.get('message_id','?')}  {r.get('ts','')}  {content}{extra}")
+    if not rows:
+        print(f"✓ caught up — nothing unactioned (actioned.cursor={cur}, max logged={_tg_maxseq(recs)})")
+        return
+    print(f"⚠️  {len(rows)} inbound message(s) logged but NOT confirmed actioned (seq > {cur}):\n")
+    print("\n".join(rows))
+    print(f"\nReview each, relay anything that slipped, then: crew tg-actioned latest")
+
+
+def cmd_tg_actioned(a):
+    """Mark Telegram inbound handled up through <seq> (or 'latest' = max logged)."""
+    recs = _tg_records()
+    mx = _tg_maxseq(recs)
+    if a.seq == "latest":
+        target = mx
+    else:
+        try:
+            target = int(a.seq)
+        except (TypeError, ValueError):
+            print(f"bad seq {a.seq!r} — use a number or 'latest'")
+            return
+    os.makedirs(TG_DIR, exist_ok=True)
+    tmp = TG_ACTIONED + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(target) + "\n")
+    os.replace(tmp, TG_ACTIONED)
+    print(f"actioned.cursor = {target}  (max logged = {mx})")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="crew", description="read-only status + restore for your Claude sessions")
     ap.set_defaults(fn=cmd_status, source=None, all=False, go=False, out=None)
@@ -969,6 +1060,12 @@ def main():
     pu.set_defaults(fn=cmd_setup)
     ps2 = sub.add_parser("doctor", help="check deps (claude, spacetag, iTerm2, PATH, agent)")
     ps2.set_defaults(fn=cmd_doctor)
+    ptu = sub.add_parser("tg-unactioned", help="Telegram inbound logged but not yet confirmed actioned by the hub")
+    ptu.add_argument("--all", action="store_true", help="include records older than the 48h review window")
+    ptu.set_defaults(fn=cmd_tg_unactioned)
+    pta = sub.add_parser("tg-actioned", help="mark Telegram inbound handled up through <seq> (or 'latest')")
+    pta.add_argument("seq", help="a seq number, or 'latest' to mark everything logged as actioned")
+    pta.set_defaults(fn=cmd_tg_actioned)
     a = ap.parse_args()
     a.fn(a)
 
