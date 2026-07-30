@@ -135,19 +135,19 @@ def pack(blocks, header="🔔 crew"):
     return msgs
 
 
-def send_chunked(token, chat, blocks_md, blocks_plain):
+def send_chunked(token, chat, blocks_md, blocks_plain, header="🔔 crew"):
     """Send MarkdownV2 blocks; if the first message is rejected (an escaping bug
     would 400), fall back to plain text for the whole batch so a formatting
     error degrades gracefully instead of dropping the report (kaolin wants
-    bulleted/bold, 2026-07-23)."""
-    md = pack(blocks_md)
+    bulleted/bold, 2026-07-23). Pass header="" for a self-headed (per-app) message."""
+    md = pack(blocks_md, header)
     for i, m in enumerate(md):
         if send(token, chat, m, parse_mode="MarkdownV2"):
             continue
         if i == 0:                                     # bad markup → plain for all
             log("markdownv2 send rejected; falling back to plain")
             ok = True
-            for pm in pack(blocks_plain):
+            for pm in pack(blocks_plain, header):
                 ok = send(token, chat, pm) and ok
             return ok
         send(token, chat, m)                           # later msg: retry unformatted
@@ -501,18 +501,20 @@ def main():
 
     if events and not in_quiet_hours(now):
         token, chats = load_token(), load_chats()
-        blocks_md, blocks_plain, shots = [], [], []
-        for kind, name, proj, extra, lines, ps in events:
-            head_plain = f"{kind} {name} ({proj}) {extra}"
-            head_md = f"{kind} *{md_escape(name)}* \\({md_escape(proj)}\\) {md_escape(extra)}"
-            blocks_md.append(render_md(head_md, lines))
-            blocks_plain.append(render_plain(head_plain, lines))
-            shots += [(head_plain, p) for p in ps]
+        stamp = time.strftime("%H:%M", time.localtime(now))
+        nshots = 0
         for c in chats:
-            send_chunked(token, c, blocks_md, blocks_plain)
-            for caption, path in shots:
-                send_photo(token, c, path, caption)
-        log(f"sent {len(events)} event(s), {len(shots)} photo(s) to {len(chats)} chat(s): "
+            # One message PER APP (not one batched "crew" blob), each self-headed
+            # with source + a visible timestamp: "✅ babypaints-08 (BabyPaints) · 08:15 · finished…"
+            for kind, name, proj, extra, lines, ps in events:
+                head_plain = f"{kind} {name} ({proj}) · {stamp} · {extra}"
+                head_md = f"{kind} *{md_escape(name)}* \\({md_escape(proj)}\\) · {md_escape(stamp)} · {md_escape(extra)}"
+                send_chunked(token, c, [render_md(head_md, lines)],
+                             [render_plain(head_plain, lines)], header="")
+                for p in ps:
+                    send_photo(token, c, p, head_plain)
+                    nshots += 1
+        log(f"sent {len(events)} per-app msg(s), {nshots} photo(s) to {len(chats)} chat(s): "
             f"{[n for _, n, _, _, _, _ in events]}")
     else:
         log(f"tick ok: {len(sessions)} sessions, {len(events)} event(s), "
