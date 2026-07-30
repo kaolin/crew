@@ -25,6 +25,7 @@ STATE_PATH  = f"{HOME}/dev/crew/pinger/state.json"
 LOG_PATH    = f"{HOME}/dev/crew/pinger/pinger.log"
 INBOUND_LOG    = f"{HOME}/.claude/channels/telegram/inbound.jsonl"
 INBOUND_CURSOR = f"{HOME}/.claude/channels/telegram/inbound.cursor"
+BOT_PID_FILE   = f"{HOME}/.claude/channels/telegram/bot.pid"
 
 # --- tunables ---------------------------------------------------------------
 NOTIFY_FINISHED   = True
@@ -34,6 +35,7 @@ STUCK_HOURS       = 3.0        # busy this long with no change -> "may be hung"
 EXCLUDE_NAMES     = {"hub"}     # sessions to never ping about (the hub itself)
 QUIET_HOURS       = None       # e.g. (23, 8) to mute 23:00-08:00 local; None = off
 TUNNEL_STALL_SECS = 120        # inbound queued-but-undelivered longer than this -> tunnel is down
+POLLER_DOWN_SECS  = 180        # bot poller process dead this long -> whole bridge down (rides out a brief restart)
 
 # "finished" alerts carry WHAT finished, plus any images the session just made.
 # A bare "✅ done after 12m" is meaningless on a phone (kaolin, 2026-07-20).
@@ -375,6 +377,50 @@ def check_tunnel(now, state):
     return already
 
 
+def poller_alive():
+    """True/False whether the telegram bot poller (bot.pid) process is running;
+    None if we can't tell (no pid file)."""
+    try:
+        pid = int(open(BOT_PID_FILE).read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)          # signal 0 = existence check, doesn't touch the process
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True              # exists but not ours (shouldn't happen) — treat as up
+    except OSError:
+        return False
+
+
+def check_poller(now, state):
+    """Alert if the bot poller PROCESS is dead — the whole bridge is down (nothing
+    received or logged, so the backlog detector can't even fire). Requires it down
+    persistently (>= POLLER_DOWN_SECS) so a normal restart doesn't false-alarm.
+    Alerts once per outage via the bot API (independent HTTP; works with the poller
+    down). Returns (alerted_flag, dead_since)."""
+    alive = poller_alive()
+    if alive is None:
+        return bool(state.get("poller_alerted")), state.get("poller_dead_since")
+    if alive:
+        if state.get("poller_alerted"):
+            log("bot poller back up — re-arming poller-down alert")
+        return False, None
+    dead_since = state.get("poller_dead_since") or now
+    already = bool(state.get("poller_alerted"))
+    if not already and (now - dead_since) >= POLLER_DOWN_SECS:
+        token, chats = load_token(), load_chats()
+        msg = ("🛑 Telegram bot poller is DOWN — the bridge process isn't running, so "
+               "no messages are being received or logged right now. Restart it: "
+               "/reload-plugins in the hub (or relaunch ~/dev/crew/hub).")
+        ok = all(send(token, c, msg) for c in chats) if chats else False
+        log(f"POLLER-DOWN alert sent (dead ~{(now-dead_since)/60:.0f}m), ok={ok}")
+        return True, dead_since
+    return already, dead_since
+
+
 def main():
     now = time.time()
 
@@ -403,12 +449,15 @@ def main():
         return
 
     state = load_state()
-    tunnel_alerted = check_tunnel(now, state)   # #4: Telegram drop-detector, out-of-band alert
+    tunnel_alerted = check_tunnel(now, state)                     # inbound queued-but-undelivered
+    poller_alerted, poller_dead_since = check_poller(now, state)  # bridge process dead
 
     sessions = get_sessions()
     if sessions is None:
-        # persist the tunnel flag; leave the fleet snapshot untouched
+        # persist the alert flags; leave the fleet snapshot untouched
         state["tunnel_alerted"] = tunnel_alerted
+        state["poller_alerted"] = poller_alerted
+        state["poller_dead_since"] = poller_dead_since
         state["updated"] = now
         save_state(state)
         return  # transient; launchd will retry next interval
@@ -446,7 +495,9 @@ def main():
                         "busy_since": None, "notified_stuck": False}
 
     save_state({"initialized": True, "updated": now, "sessions": new,
-                "tunnel_alerted": tunnel_alerted})
+                "tunnel_alerted": tunnel_alerted,
+                "poller_alerted": poller_alerted,
+                "poller_dead_since": poller_dead_since})
 
     if events and not in_quiet_hours(now):
         token, chats = load_token(), load_chats()
