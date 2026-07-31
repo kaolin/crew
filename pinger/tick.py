@@ -39,7 +39,9 @@ POLLER_DOWN_SECS  = 180        # bot poller process dead this long -> whole brid
 
 # "finished" alerts carry WHAT finished, plus any images the session just made.
 # A bare "✅ done after 12m" is meaningless on a phone (kaolin, 2026-07-20).
-GIST_CHARS        = 3500      # max chars of the closing message (chunker splits if needed)
+GIST_CHARS        = 12000     # max chars of the closing message; batched across
+                              # messages, not trimmed — a synthesis report cut
+                              # mid-list is useless on a phone (kaolin, 2026-07-31)
 MIN_GIST_CHARS    = 80         # ignore short acks ("On it.") when picking the gist
 SEND_PHOTOS       = True       # attach screenshots/renders the session just wrote
 MAX_ARTIFACTS     = 3          # photos per finished session
@@ -135,19 +137,22 @@ def pack(blocks, header="🔔 crew"):
     return msgs
 
 
-def send_chunked(token, chat, blocks_md, blocks_plain, header="🔔 crew"):
+def send_chunked(token, chat, blocks_md, blocks_plain, header="🔔 crew",
+                 prepacked=False):
     """Send MarkdownV2 blocks; if the first message is rejected (an escaping bug
     would 400), fall back to plain text for the whole batch so a formatting
     error degrades gracefully instead of dropping the report (kaolin wants
-    bulleted/bold, 2026-07-23). Pass header="" for a self-headed (per-app) message."""
-    md = pack(blocks_md, header)
+    bulleted/bold, 2026-07-23). Pass header="" for a self-headed (per-app) message.
+    prepacked=True means the caller already split at line boundaries (split_report)
+    — send as-is instead of re-grouping."""
+    md = blocks_md if prepacked else pack(blocks_md, header)
     for i, m in enumerate(md):
         if send(token, chat, m, parse_mode="MarkdownV2"):
             continue
         if i == 0:                                     # bad markup → plain for all
             log("markdownv2 send rejected; falling back to plain")
             ok = True
-            for pm in pack(blocks_plain, header):
+            for pm in (blocks_plain if prepacked else pack(blocks_plain, header)):
                 ok = send(token, chat, pm) and ok
             return ok
         send(token, chat, m)                           # later msg: retry unformatted
@@ -159,13 +164,30 @@ def transcript_path(cwd, session_id):
     return f"{HOME}/.claude/projects/{enc}/{session_id}.jsonl"
 
 
+def _table_row(ln):
+    """'| Vision Pro port | Park — … |' → 'Vision Pro port — Park — …'.
+    Separator rows ('|---|---|') return ''. Markdown tables used to be dropped
+    whole, which silently ate an entire cut/park decision table out of an orrery
+    report (kaolin, 2026-07-31)."""
+    cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+    if not any(c.strip("-: ") for c in cells):
+        return ""
+    return " — ".join(c for c in cells if c)
+
+
 def _clean(text):
     """Assistant message → clean lines, list items marked with '• '. Returns a
     list of (is_bullet, text) so callers can render plain or MarkdownV2."""
     out = []
     for raw in text.splitlines():
         ln = raw.strip()
-        if not ln or ln.startswith(("```", "|", ">")):
+        if not ln or ln.startswith(("```", ">")):
+            continue
+        if ln.startswith("|"):
+            ln = _table_row(ln)
+            if not ln:
+                continue
+            out.append((True, ln.replace("**", "").replace("`", "")))
             continue
         bullet = ln.startswith(("- ", "* ", "• "))
         ln = ln.lstrip("#").strip()
@@ -222,6 +244,39 @@ def render_plain(head, lines):
 def render_md(head_md, lines):
     body = "\n".join(("• " + md_escape(t)) if b else md_escape(t) for b, t in lines)
     return f"{head_md}\n{body}" if body else head_md
+
+
+def split_report(head, lines, escape=False, limit=TG_LIMIT - 60):
+    """Head + body → as few messages as fit, split on LINE boundaries.
+
+    Long reports get batched across messages rather than trimmed mid-list
+    (kaolin, 2026-07-31 — an orrery synthesis was cut right before the pricing
+    decision). Continuation messages are marked '… n/N'; that marker and the
+    ellipsis are MarkdownV2-safe, so it survives both render paths."""
+    esc = md_escape if escape else (lambda t: t)
+    rendered = [("• " + esc(t)) if b else esc(t) for b, t in lines]
+
+    msgs, cur = [], head
+    for ln in rendered:
+        while len(ln) > limit:                       # single monster line
+            cut = ln.rfind(" ", 0, limit)
+            if cut <= 0:
+                cut = limit
+            part, ln = ln[:cut], "…" + ln[cut:].lstrip()
+            if cur and len(cur) + 1 + len(part) > limit:
+                msgs.append(cur); cur = ""
+            cur += ("\n" if cur else "") + part
+        if cur and len(cur) + 1 + len(ln) > limit:
+            msgs.append(cur); cur = ""
+        cur += ("\n" if cur else "") + ln
+    if cur.strip():
+        msgs.append(cur)
+    if not msgs:
+        return [head]
+    if len(msgs) > 1:
+        n = len(msgs)
+        msgs = [m if i == 0 else f"… {i + 1}/{n}\n{m}" for i, m in enumerate(msgs)]
+    return msgs
 
 
 def find_artifacts(path, since, cap=MAX_ARTIFACTS):
@@ -433,10 +488,12 @@ def main():
             tpath = transcript_path(s.get("cwd"), s["sessionId"])
             proj  = os.path.basename(s.get("cwd", "")) or "?"
             lines = last_gist(tpath)
-            print(f"\n✅ {s['name']} ({proj}) finished after Nm")
-            print(render_plain("", lines) or "   (no gist found)")
-            print("  --- markdownv2 ---")
-            print(render_md("", lines))
+            head = f"✅ {s['name']} ({proj}) finished after Nm"
+            parts = split_report(head, lines)
+            print(f"\n{'=' * 60}")
+            for i, m in enumerate(parts):
+                print(f"--- msg {i + 1}/{len(parts)}  ({len(m)} chars) ---")
+                print(m if m.strip() else "   (no gist found)")
             for p in find_artifacts(tpath, now - 6 * 3600):
                 print(f"   📎 {p}")
         return
@@ -509,8 +566,10 @@ def main():
             for kind, name, proj, extra, lines, ps in events:
                 head_plain = f"{kind} {name} ({proj}) · {stamp} · {extra}"
                 head_md = f"{kind} *{md_escape(name)}* \\({md_escape(proj)}\\) · {md_escape(stamp)} · {md_escape(extra)}"
-                send_chunked(token, c, [render_md(head_md, lines)],
-                             [render_plain(head_plain, lines)], header="")
+                send_chunked(token, c,
+                             split_report(head_md, lines, escape=True),
+                             split_report(head_plain, lines),
+                             header="", prepacked=True)
                 for p in ps:
                     send_photo(token, c, p, head_plain)
                     nshots += 1
