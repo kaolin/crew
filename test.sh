@@ -122,6 +122,68 @@ assert m._artifact_urls('no links here')==[]
 print('  artifact extraction OK')
 " || fail "artifact extraction wrong"
 
+echo "== blocked sessions: question vs permission, and tell refuses both =="
+python3 -c "
+import json, os, tempfile
+from importlib.machinery import SourceFileLoader
+from importlib.util import spec_from_loader, module_from_spec
+l=SourceFileLoader('crewmod','./crew'); m=module_from_spec(spec_from_loader('crewmod',l)); l.exec_module(m)
+
+def jl(rows):
+    fd,p=tempfile.mkstemp(suffix='.jsonl')
+    with os.fdopen(fd,'w') as f:
+        for r in rows: f.write(json.dumps(r)+'\n')
+    return p
+def tu(i,n,inp): return {'type':'assistant','message':{'role':'assistant','content':[{'type':'tool_use','id':i,'name':n,'input':inp}]}}
+def tr(i):       return {'type':'user','message':{'role':'user','content':[{'type':'tool_result','tool_use_id':i,'content':'ok'}]}}
+
+ASK={'questions':[{'question':'Name for the unlock?','options':[{'label':'Deep Time'},{'label':'20,000 Years'}]}]}
+
+# an AskUserQuestion with no result = a question FOR KAOLIN
+p=jl([tu('t1','Read',{'file_path':'/a'}),tr('t1'),tu('t2','AskUserQuestion',ASK)])
+got=m._pending({'sessionId':'x'},screen=False) if False else None
+m._jsonl_path=lambda s,_p=p: _p
+got=m._pending({'sessionId':'x'},screen=False)
+assert got and got['kind']=='question', got
+assert 'Name for the unlock' in got['detail'], got
+assert got['options']==['Deep Time','20,000 Years'], got
+assert 'QUESTION FOR YOU' in m._pending_line(got), m._pending_line(got)
+os.unlink(p)
+
+# a tool awaiting approval = a permission prompt (the disasteroids Artifact case)
+p=jl([tu('a1','Artifact',{'file_path':'/tmp/gallery.html'})])
+m._jsonl_path=lambda s,_p=p: _p
+got=m._pending({'sessionId':'x'},screen=False)
+assert got and got['kind']=='permission' and got['tool']=='Artifact', got
+assert 'gallery.html' in got['detail'], got
+os.unlink(p)
+
+# everything answered = nothing pending
+p=jl([tu('b1','Bash',{'command':'ls'}),tr('b1')])
+m._jsonl_path=lambda s,_p=p: _p
+assert m._pending({'sessionId':'x'},screen=False) is None
+os.unlink(p)
+
+# screen fallback: option-picker chrome on screen, nothing in the transcript
+rows=['Which model should I build for the release?','❯ 1. Free + \$1.99 color unlock (Recommended)',
+      '  2. Completely free','  5. Type something.','────────','  6. Chat about this',
+      'Enter to select · ↑/↓ to navigate · Esc to cancel']
+sc=m._classify_screen(rows)
+assert sc and sc['kind']=='question', sc
+assert sc['detail'].startswith('Which model'), sc
+assert 'Free + \$1.99 color unlock (Recommended)' in sc['options'], sc
+assert 'Type something.' not in sc['options'], sc   # picker chrome, not a real choice
+assert m._classify_screen(['just some output','no chrome here']) is None
+assert m._classify_screen([]) is None
+
+# the guard itself: refuses ONLY when waiting, and never silently
+assert m._blocked_refusal({'name':'n','status':'idle'},'send') is False
+assert m._blocked_refusal({'name':'n','status':'busy'},'send') is False
+m._pending=lambda s,**k: {'kind':'question','tool':'AskUserQuestion','detail':'q?','options':['a']}
+assert m._blocked_refusal({'name':'n','status':'waiting'},'send') is True
+print('  blocked-session detection + tell guard OK')
+" || fail "blocked-session handling wrong"
+
 echo "== doctor runs; setup --dry-run changes nothing =="
 ./crew doctor >/dev/null || fail "doctor errored"
 sdry=$(./crew setup --dry-run)

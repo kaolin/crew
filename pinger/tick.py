@@ -30,6 +30,8 @@ BOT_PID_FILE   = f"{HOME}/.claude/channels/telegram/bot.pid"
 # --- tunables ---------------------------------------------------------------
 NOTIFY_FINISHED   = True
 NOTIFY_STUCK      = True
+NOTIFY_WAITING    = True       # session blocked on a question/permission prompt -> ping
+                               # (it never un-blocks on its own; silence = lost hours)
 MIN_FINISHED_SECS = 120        # only ping "finished" for busy episodes >= this
 STUCK_HOURS       = 3.0        # busy this long with no change -> "may be hung"
 EXCLUDE_NAMES     = {"hub"}     # sessions to never ping about (the hub itself)
@@ -277,6 +279,78 @@ def split_report(head, lines, escape=False, limit=TG_LIMIT - 60):
         n = len(msgs)
         msgs = [m if i == 0 else f"… {i + 1}/{n}\n{m}" for i, m in enumerate(msgs)]
     return msgs
+
+
+def pending_prompt(path, tail=400):
+    """What a `waiting` session is blocked on: ('question'|'permission', text).
+
+    `claude agents --json` says only "permission prompt" for both, but a question
+    meant for kaolin is the one he must see on his phone — orrery sat on an unseen
+    IAP-name question for 1h40m (2026-07-31). A tool_use with no tool_result is it.
+    """
+    try:
+        with open(path, errors="replace") as f:
+            lines = f.readlines()[-tail:]
+    except OSError:
+        return None
+
+    answered, pend = set(), None
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        body = (r.get("message") or {}).get("content")
+        if not isinstance(body, list):
+            continue
+        for b in body:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_result" and b.get("tool_use_id"):
+                answered.add(b["tool_use_id"])
+            elif b.get("type") == "tool_use":
+                pend = b
+    if not pend or pend.get("id") in answered:
+        return None
+
+    name, inp = pend.get("name", "tool"), pend.get("input") or {}
+    if name == "AskUserQuestion":
+        q = (inp.get("questions") or [{}])[0]
+        out = [q.get("question", "(question)")]
+        out += [f"{i}. {o.get('label','')}" for i, o in enumerate(q.get("options") or [], 1)]
+        return ("question", "\n".join(out))
+    detail = inp.get("command") or inp.get("file_path") or inp.get("url") or ""
+    return ("permission", f"{name} — {' '.join(str(detail).split())[:200]}")
+
+
+CREW_BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "crew")
+
+
+def pending_via_crew(name, timeout=10):
+    """Ask `crew pending <name>` — it can scrape the live terminal, which we can't
+    from launchd, so it sees prompts the transcript hasn't logged. [] on any
+    failure; this is enrichment, never the thing the alert depends on."""
+    try:
+        out = subprocess.run([CREW_BIN, "pending", name],
+                             capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0 or not out.stdout.strip():
+        return []
+    skip = ("nothing pending in the transcript", "scraping the screen",
+            "answer with:", "you have to approve/deny", "(not reachable",
+            # crew reports these on stdout and still exits 0
+            "no running session matches", "is ambiguous", "couldn't find the tty",
+            "nothing waiting")
+    rows = []
+    for ln in out.stdout.splitlines():
+        t = ln.strip()
+        if not t or t.startswith("─") or any(k in t for k in skip):
+            continue
+        if t.startswith(name):                      # the header line
+            continue
+        rows.append(t)
+    return rows[:20]
 
 
 def find_artifacts(path, since, cap=MAX_ARTIFACTS):
@@ -538,6 +612,31 @@ def main():
                 notified = True
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
                         "busy_since": busy_since, "notified_stuck": notified}
+        elif status == "waiting":
+            # NOT finished — it's blocked ON KAOLIN and will sit there forever.
+            # This used to fall through to the idle branch and get reported as
+            # "✅ finished", which is how orrery lost 1h40m (kaolin, 2026-07-31).
+            tpath = transcript_path(s.get("cwd"), sid)
+            pend = pending_prompt(tpath) if NOTIFY_WAITING else None
+            notified = bool(p.get("notified_waiting"))
+            if (NOTIFY_WAITING and not notified and not first_run
+                    and name not in EXCLUDE_NAMES):
+                detail = pend[1] if pend else ""
+                extra = pending_via_crew(name)      # sees screen-only prompts
+                if not detail and extra:
+                    detail = "\n".join(extra)
+                    if any(k in detail for k in ("Enter to select", "1.")):
+                        pend = ("question", detail)
+                if pend and pend[0] == "question":
+                    glyph, what = "🙋", "needs your answer"
+                else:
+                    glyph, what = "🔐", "blocked on a permission prompt"
+                body = _clean(detail) if detail else [(False, "run: crew pending")]
+                events.append((glyph, name, proj, what, body, []))
+                notified = True
+            new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
+                        "busy_since": p.get("busy_since"), "notified_stuck": False,
+                        "notified_waiting": notified}
         else:  # idle
             if (NOTIFY_FINISHED and not first_run
                     and name not in EXCLUDE_NAMES
@@ -549,7 +648,8 @@ def main():
                 shots = find_artifacts(tpath, p["busy_since"]) if SEND_PHOTOS else []
                 events.append(("✅", name, proj, f"finished after {mins:.0f}m", lines, shots))
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
-                        "busy_since": None, "notified_stuck": False}
+                        "busy_since": None, "notified_stuck": False,
+                        "notified_waiting": False}
 
     save_state({"initialized": True, "updated": now, "sessions": new,
                 "tunnel_alerted": tunnel_alerted,

@@ -118,7 +118,13 @@ def cmd_status(a):
             line = (f"    {c(code, glyph)} {c(code, st.ljust(9))} "
                     f"{(s.get('name') or '').ljust(20)} {c('2', age(s.get('startedAt')).rjust(6))}")
             if s.get("waitingFor"):
-                line += c("33", f"   ⟵ {s['waitingFor']}")
+                # The CLI always says "permission prompt"; a question meant for
+                # kaolin looks identical until you read the transcript.
+                p = _pending(s) if st == "waiting" else None
+                if p and p["kind"] == "question":
+                    line += c("33;1", "   ⟵ QUESTION FOR YOU")
+                else:
+                    line += c("33", f"   ⟵ {s['waitingFor']}")
             print(line)
         print()
 
@@ -659,6 +665,116 @@ def _assistant_since(s, before_lines):
     return out
 
 
+def _pending(s, tail=400, screen=True):
+    """What a `waiting` session is actually blocked on, from its transcript.
+
+    `claude agents --json` only ever says waitingFor="permission prompt", but the
+    two cases need OPPOSITE handling from the hub:
+
+      question   — an AskUserQuestion meant for kaolin. Anything typed at it is
+                   consumed as his answer. (2026-07-31: a stray hub probe got
+                   submitted as the answer to orrery's IAP-name question.)
+      permission — a tool-approval dialog. Typed text can select an option, so
+                   sending is worse than useless.
+
+    Returns {kind, tool, detail, options} or None if nothing is pending.
+    A tool_use with no matching tool_result is the thing being waited on.
+    """
+    try:
+        with open(_jsonl_path(s), errors="ignore") as f:
+            lines = f.readlines()[-tail:]
+    except Exception:
+        return None
+
+    answered, pend = set(), None
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+        except Exception:
+            continue
+        body = (r.get("message") or {}).get("content")
+        if not isinstance(body, list):
+            continue
+        for b in body:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_result" and b.get("tool_use_id"):
+                answered.add(b["tool_use_id"])
+            elif b.get("type") == "tool_use":
+                pend = b
+    if not pend or pend.get("id") in answered:
+        # The tool_use isn't always logged before the prompt goes up; the screen
+        # is authoritative for what's actually being asked.
+        return _classify_screen(_screen_tail(s)) if screen else None
+
+    name, inp = pend.get("name", "tool"), pend.get("input") or {}
+    if name == "AskUserQuestion":
+        qs = inp.get("questions") or []
+        q = qs[0] if qs else {}
+        return {"kind": "question", "tool": name,
+                "detail": q.get("question", "(unspecified question)"),
+                "options": [o.get("label", "") for o in (q.get("options") or [])]}
+    detail = inp.get("command") or inp.get("file_path") or inp.get("url") or ""
+    if not detail:
+        detail = json.dumps(inp)[:200] if inp else ""
+    return {"kind": "permission", "tool": name,
+            "detail": " ".join(str(detail).split())[:300], "options": []}
+
+
+# The option-picker chrome Claude Code draws for AskUserQuestion. Present on
+# screen even when the tool_use hasn't been written to the transcript yet.
+_ASK_CHROME = ("Enter to select", "↑/↓ to navigate")
+
+
+def _classify_screen(rows):
+    """Screen rows → a _pending-shaped dict, or None. Used when the transcript
+    hasn't logged the pending tool_use (live case, 2026-08-01: sandpainting)."""
+    if not rows:
+        return None
+    blob = "\n".join(rows)
+    if not any(k in blob for k in _ASK_CHROME):
+        return None
+    opts, question = [], ""
+    for ln in rows:
+        t = ln.strip().lstrip("❯").strip()
+        m = re.match(r"^(\d+)\.\s+(.*)$", t)
+        if m:
+            opts.append(m.group(2).strip())
+        elif not opts and t and not t.startswith("─"):
+            question = t                      # last prose line before the options
+    if not opts:
+        return None
+    opts = [o for o in opts if o.lower() not in ("type something.", "chat about this")]
+    return {"kind": "question", "tool": "AskUserQuestion",
+            "detail": question or "(see the screen)", "options": opts}
+
+
+def _screen_tail(s, lines=18):
+    """Last N lines of the session's live terminal, or [] if not scrapeable.
+    The transcript is structured but lags; the screen is what's actually asking."""
+    try:
+        tty = _tty_of(s.get("pid"))
+        if not tty:
+            return []
+        out = adapter_for(tty).peek(tty)
+        if not out:
+            return []
+        rows = [x.rstrip() for x in out.replace("\r", "\n").split("\n")]
+        return [x for x in rows if x.strip()][-lines:]
+    except Exception:
+        return []
+
+
+def _pending_line(p):
+    """One-line summary of a pending prompt, for status/refusal messages."""
+    if not p:
+        return "waiting (nothing pending in transcript — check the terminal)"
+    if p["kind"] == "question":
+        opts = f"  [{' / '.join(o for o in p['options'] if o)}]" if p["options"] else ""
+        return f"QUESTION FOR YOU: {p['detail']}{opts}"
+    return f"permission: {p['tool']} — {p['detail']}"
+
+
 def _session_now(sid):
     """Refetch one session's live record from `claude agents --json` (for polling)."""
     try:
@@ -708,6 +824,8 @@ def cmd_peek(a):
     hdr = c("1", f"{s.get('name')}  [{s.get('status')}]  {proj(s.get('cwd'))}")
     if s.get("waitingFor"):
         hdr += c("33", f"   ⟵ {s['waitingFor']}")
+        if s.get("status") == "waiting":
+            hdr += "\n  " + c("33;1", _pending_line(_pending(s)))
     if a.screen:  # raw terminal scrape — the live TUI (needs a drivable adapter)
         ad = adapter_for(tty)
         out = ad.peek(tty)
@@ -729,9 +847,74 @@ def cmd_peek(a):
         print(c("2", "  (no transcript)"))
 
 
+def _blocked_refusal(s, verb):
+    """True (and explains) if the session is waiting on a prompt and must not be
+    typed at. Text sent to a `waiting` session is consumed by whatever dialog is
+    up — it answers a question or picks a permission option. Never silent."""
+    if s.get("status") != "waiting":
+        return False
+    p = _pending(s)
+    print(c("33;1", f"{s.get('name')} is WAITING — {_pending_line(p)}"))
+    if p and p["kind"] == "question":
+        print(c("33", "  Anything sent now becomes kaolin's answer to that question."))
+        print(c("2",  "  Relay the question to him; send his real answer with --force."))
+    else:
+        print(c("33", "  Text sent now can select an option in the permission dialog."))
+        print(c("2",  "  He has to clear it in the session's Space first."))
+    print(c("2", f"  --force to {verb} anyway."))
+    return True
+
+
+def cmd_pending(a):
+    """What every blocked session needs from kaolin — the whole point of the hub.
+
+    Without a name: every waiting session at once, so nothing sits unnoticed
+    (orrery burned 1h40m on an unseen question, 2026-07-31)."""
+    if a.name:
+        s, _ = _pick(a.name)
+        if not s:
+            return
+        rows = [s]
+    else:
+        rows = [x for x in (load(include_all=True) or [])
+                if x.get("status") == "waiting" and x.get("name") not in ("hub",)]
+    if not rows:
+        print("nothing waiting — no session is blocked on you.")
+        return
+    for s in rows:
+        p = _pending(s)
+        head = c("1", f"{s.get('name')}") + c("2", f"  ({proj(s.get('cwd'))})")
+        print(f"\n{head}")
+        if not p:
+            # Claude Code doesn't always log the pending tool_use before asking,
+            # so fall back to what's literally on the terminal (found live,
+            # 2026-08-01: sandpainting waiting with a clean transcript tail).
+            print("  " + c("2", "nothing pending in the transcript — scraping the screen:"))
+            scr = _screen_tail(s, lines=a.lines)
+            if scr:
+                for ln in scr:
+                    print("    " + ln)
+            else:
+                print("    " + c("2", "(not reachable — look at its Space directly)"))
+            continue
+        if p["kind"] == "question":
+            print("  " + c("33;1", "QUESTION FOR YOU"))
+            print("  " + p["detail"])
+            for i, o in enumerate(p["options"], 1):
+                print("    " + c("36", f"{i}. {o}"))
+            print("  " + c("2", "answer with: crew tell --force " + str(s.get("name")) + " \"<answer>\""))
+        else:
+            print("  " + c("33", f"permission prompt: {p['tool']}"))
+            print("  " + p["detail"])
+            print("  " + c("2", "you have to approve/deny this in its Space — do not type at it."))
+    print()
+
+
 def cmd_tell(a):
     s, tty = _pick(a.name)
     if not s:
+        return
+    if not a.force and _blocked_refusal(s, "send"):
         return
     if s.get("status") == "busy" and not a.force:
         print(f"{s.get('name')} is busy (mid-turn). --force to send anyway (it'll queue).")
@@ -746,6 +929,8 @@ def cmd_ask(a):
     """Send a prompt and wait for the reply — a synchronous round-trip to a session."""
     s, tty = _pick(a.name)
     if not s:
+        return
+    if not a.force and _blocked_refusal(s, "ask"):
         return
     if s.get("status") == "busy" and not a.force:
         print(f"{s.get('name')} is busy (mid-turn). --force to queue behind its current turn.")
@@ -1032,15 +1217,19 @@ def main():
     pk.add_argument("--screen", action="store_true", help="raw terminal scrape instead of the transcript")
     pk.add_argument("--lines", type=int, default=40, help="lines to show with --screen")
     pk.set_defaults(fn=cmd_peek)
+    pp = sub.add_parser("pending", help="what blocked sessions need from you (questions vs permission prompts)")
+    pp.add_argument("name", nargs="?", help="one session; omit for every waiting session")
+    pp.add_argument("--lines", type=int, default=18, help="screen lines to scrape when the transcript has nothing")
+    pp.set_defaults(fn=cmd_pending)
     pt = sub.add_parser("tell", help="type a prompt into an idle session and submit it (fire-and-forget)")
     pt.add_argument("name")
     pt.add_argument("message")
-    pt.add_argument("--force", action="store_true", help="send even if the session is busy")
+    pt.add_argument("--force", action="store_true", help="send even if the session is busy or waiting on a prompt")
     pt.set_defaults(fn=cmd_tell)
     pa = sub.add_parser("ask", help="send a prompt and WAIT for the reply (synchronous round-trip)")
     pa.add_argument("name")
     pa.add_argument("message")
-    pa.add_argument("--force", action="store_true", help="ask even if the session is busy")
+    pa.add_argument("--force", action="store_true", help="ask even if the session is busy or waiting on a prompt")
     pa.add_argument("--timeout", type=int, default=300, help="seconds to wait for the reply")
     pa.set_defaults(fn=cmd_ask)
     pj = sub.add_parser("jump", help="switch to a session's Space (via spacetag) and front its window")
