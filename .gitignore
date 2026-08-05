@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 .DS_Store
 *.profraw
+
+# pinger runtime artifacts — hold live session names and local paths
+pinger/state.json
+pinger/*.log

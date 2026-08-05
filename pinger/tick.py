@@ -326,6 +326,23 @@ def pending_prompt(path, tail=400):
 CREW_BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "crew")
 
 
+def at_prompt_via_crew(name, timeout=10):
+    """True if `crew at-prompt <name>` says the session is typeable right now.
+
+    A session stays "busy" in `claude agents --json` for as long as any
+    background shell or monitor lives, so a finished turn can look hung for
+    hours (thereby-ed, 2026-08-05: 3h "may be hung" with its report on screen).
+    Only crew can see this — it scrapes the terminal, which launchd can't.
+    On any failure return False, so we fall back to alerting rather than going
+    quiet about a session that might really be stuck."""
+    try:
+        out = subprocess.run([CREW_BIN, "at-prompt", name],
+                             capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0
+
+
 def pending_via_crew(name, timeout=10):
     """Ask `crew pending <name>` — it can scrape the live terminal, which we can't
     from launchd, so it sees prompts the transcript hasn't logged. [] on any
@@ -607,7 +624,10 @@ def main():
             notified   = bool(p.get("notified_stuck"))
             if (NOTIFY_STUCK and not notified and not first_run
                     and name not in EXCLUDE_NAMES
-                    and (now - busy_since) >= STUCK_HOURS * 3600):
+                    and (now - busy_since) >= STUCK_HOURS * 3600
+                    # Not hung if it's sitting at an empty prompt — that's a
+                    # background shell holding the flag, not a stalled turn.
+                    and not at_prompt_via_crew(name)):
                 events.append(("⏳", name, proj, f"busy {(now-busy_since)/3600:.1f}h — may be hung", [], []))
                 notified = True
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,

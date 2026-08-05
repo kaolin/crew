@@ -125,6 +125,10 @@ def cmd_status(a):
                     line += c("33;1", "   ⟵ QUESTION FOR YOU")
                 else:
                     line += c("33", f"   ⟵ {s['waitingFor']}")
+            elif st == "busy" and at_prompt(s):
+                # Busy only because a background shell/monitor is alive; the
+                # model is done and the prompt will take input right now.
+                line += c("2", "   ⟵ at prompt (bg task)")
             print(line)
         print()
 
@@ -381,6 +385,12 @@ class ITerm2Adapter:
             time.sleep(0.6)
         return "__OK__" in _osa(_OSA_SUBMIT, tty)
 
+    def keys(self, tty, chunk):
+        """Send raw bytes with NO trailing Enter — the only way to drive a
+        multi-select (Space toggles, arrows move). `tell` always submits, which
+        silently does nothing to a checkbox list (2026-08-03, disasteroids)."""
+        return "__OK__" in _osa(_OSA_TYPE, tty, chunk)
+
     def jump(self, tty):
         """Front the session's window/tab/pane. Returns True on success."""
         return "__OK__" in _osa(_OSA_JUMP, tty)
@@ -425,6 +435,10 @@ class TmuxAdapter:
         else:
             self._tmux("send-keys", "-t", self.target, "-l", msg)   # literal text, then submit
         return self._tmux("send-keys", "-t", self.target, "Enter").returncode == 0
+
+    def keys(self, tty, chunk):
+        """Raw bytes, no Enter — see the iTerm2 adapter's keys() for why."""
+        return self._tmux("send-keys", "-t", self.target, "-l", chunk).returncode == 0
 
     def jump(self, tty):
         # select the pane within tmux (can't front the attached GUI terminal window)
@@ -765,6 +779,41 @@ def _screen_tail(s, lines=18):
         return []
 
 
+def generating(rows):
+    """True when the model is mid-turn on this screen.
+
+    Two independent tells, either sufficient:
+      * the footer offers "esc to interrupt" — only shown while a turn runs;
+      * the spinner is live — "✻ Manifesting… (3m 2s · ↓ 8.2k tokens)". Note the
+        ellipsis and parenthesised counter. A *finished* turn leaves the spinner
+        line behind in past tense — "✻ Sautéed for 13m 14s · 1 shell still
+        running" — so matching on "✻" alone would read done as running."""
+    for r in rows or []:
+        if "esc to interrupt" in r:
+            return True
+        if r.lstrip().startswith("✻") and re.search(r"…\s*\(", r):
+            return True
+    return False
+
+
+def at_prompt(s, rows=None):
+    """True when the session is typeable right now — model idle, input box up.
+
+    `claude agents --json` reports **busy** while any background shell, monitor
+    or task is alive, even after the model has finished. On 2026-08-05
+    thereby-ed sat "busy" for three hours with a finished report on screen and a
+    watcher waiting on an offline phone; the pinger called it "may be hung" and
+    four queued relays never went in.
+
+    The ❯ box alone does NOT mean idle — Claude Code keeps it up while
+    generating so you can queue input (caught live against the hub itself,
+    which reported "at prompt" mid-turn). So require the box *and* the absence
+    of any generating tell."""
+    rows = _screen_tail(s, lines=12) if rows is None else rows
+    rows = rows or []
+    return any(r.strip() == "❯" for r in rows[-6:]) and not generating(rows)
+
+
 def _pending_line(p):
     """One-line summary of a pending prompt, for status/refusal messages."""
     if not p:
@@ -865,6 +914,40 @@ def _blocked_refusal(s, verb):
     return True
 
 
+# Named keys for `crew keys`. A checkbox list can't be driven any other way:
+# digits do nothing, and `tell` appends Enter which submits a half-filled form.
+_KEYS = {
+    "space": " ", "enter": "\r", "return": "\r", "tab": "\t", "esc": "\x1b",
+    "up": "\x1b[A", "down": "\x1b[B", "right": "\x1b[C", "left": "\x1b[D",
+}
+
+
+def cmd_keys(a):
+    """Send raw keystrokes to a session without submitting.
+
+    `crew keys disasteroids-bc space down down space enter`
+    Anything not a named key is typed literally. Use for multi-select pickers;
+    for ordinary prompts use `tell`."""
+    s, tty = _pick(a.name)
+    if not s:
+        return
+    if s.get("status") == "waiting" and not a.force:
+        p = _pending(s)
+        print(c("33;1", f"{s.get('name')} is WAITING — {_pending_line(p)}"))
+        print(c("2", "  keys is how you answer it; pass --force once you've read the screen."))
+        return
+    ad = adapter_for(tty)
+    sent = []
+    for tok in a.key:
+        chunk = _KEYS.get(tok.lower(), tok)
+        if not ad.keys(tty, chunk):
+            print(f"{s.get('name')} not reachable via {ad.name} (tty {tty}) — sent {sent}")
+            return
+        sent.append(tok)
+        time.sleep(a.delay)
+    print(f"→ sent {sent} to {s.get('name')} ({proj(s.get('cwd'))})")
+
+
 def cmd_pending(a):
     """What every blocked session needs from kaolin — the whole point of the hub.
 
@@ -910,13 +993,25 @@ def cmd_pending(a):
     print()
 
 
+def cmd_at_prompt(a):
+    """Exit 0 when the session is typeable right now. Lets the pinger tell a
+    genuinely hung session from one that is only 'busy' because a background
+    shell outlived the turn."""
+    s, _ = _pick(a.name)
+    if not s:
+        sys.exit(2)
+    ready = at_prompt(s)
+    print(f"{s.get('name')}: " + ("at prompt" if ready else "not at prompt"))
+    sys.exit(0 if ready else 1)
+
+
 def cmd_tell(a):
     s, tty = _pick(a.name)
     if not s:
         return
     if not a.force and _blocked_refusal(s, "send"):
         return
-    if s.get("status") == "busy" and not a.force:
+    if s.get("status") == "busy" and not a.force and not at_prompt(s):
         print(f"{s.get('name')} is busy (mid-turn). --force to send anyway (it'll queue).")
         return
     ad = adapter_for(tty)
@@ -932,7 +1027,7 @@ def cmd_ask(a):
         return
     if not a.force and _blocked_refusal(s, "ask"):
         return
-    if s.get("status") == "busy" and not a.force:
+    if s.get("status") == "busy" and not a.force and not at_prompt(s):
         print(f"{s.get('name')} is busy (mid-turn). --force to queue behind its current turn.")
         return
     ad = adapter_for(tty)
@@ -1217,10 +1312,20 @@ def main():
     pk.add_argument("--screen", action="store_true", help="raw terminal scrape instead of the transcript")
     pk.add_argument("--lines", type=int, default=40, help="lines to show with --screen")
     pk.set_defaults(fn=cmd_peek)
+    pky = sub.add_parser("keys", help="send raw keystrokes with NO Enter (drives multi-select pickers)")
+    pky.add_argument("name")
+    pky.add_argument("key", nargs="+", help="space/enter/tab/up/down/left/right/esc, or literal text")
+    pky.add_argument("--force", action="store_true", help="send even if the session is waiting on a prompt")
+    pky.add_argument("--delay", type=float, default=0.25, help="seconds between keys")
+    pky.set_defaults(fn=cmd_keys)
     pp = sub.add_parser("pending", help="what blocked sessions need from you (questions vs permission prompts)")
     pp.add_argument("name", nargs="?", help="one session; omit for every waiting session")
     pp.add_argument("--lines", type=int, default=18, help="screen lines to scrape when the transcript has nothing")
     pp.set_defaults(fn=cmd_pending)
+    pap = sub.add_parser("at-prompt",
+                         help="exit 0 if the session shows an empty input box (busy only from a bg task)")
+    pap.add_argument("name")
+    pap.set_defaults(fn=cmd_at_prompt)
     pt = sub.add_parser("tell", help="type a prompt into an idle session and submit it (fire-and-forget)")
     pt.add_argument("name")
     pt.add_argument("message")
