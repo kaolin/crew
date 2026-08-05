@@ -34,8 +34,11 @@ macOS + iTerm2; uses the `claude` CLI (Claude Code).
 | `crew` · `crew status` | fleet overview, grouped by project, needs-you first |
 | `crew artifacts` | gallery of every live artifact URL your fleet has published |
 | `crew peek <name>` | read a session's recent conversation (any terminal; `--screen` for raw TUI) |
+| `crew pending [name]` | what every blocked session needs from you — questions vs permission prompts |
 | `crew ask <name> "…"` | send a prompt and **wait for the reply** (round-trip) |
 | `crew tell <name> "…"` | fire-and-forget a prompt to an **idle** session |
+| `crew keys <name> down enter` | raw keystrokes, no Enter appended — drives multi-select pickers |
+| `crew at-prompt <name>` | exit 0 if it'll take input now (`busy` can just mean a background task) |
 | `crew jump <name>` | go to where its window *actually* is (+ front it) |
 | `crew goto <name>` | go to its *tagged* (intended) Space |
 | `crew where <name>` | show actual Space vs. tagged home |
@@ -55,6 +58,22 @@ macOS + iTerm2; uses the `claude` CLI (Claude Code).
   `~/.crew/latest.json` (shutdown-safe, keeps history in `~/.crew/history/`). After a
   reboot, `crew restore --go` reopens, places, and resumes every session. Session
   state lives on disk (`~/.claude/projects/…`), so nothing is lost.
+
+## Reach your fleet from your phone (optional)
+
+Run one session as a **hub**: Telegram messages from your phone land in it, it drives
+crew, and a launchd daemon pushes back "finished" and "needs you" alerts — so you can
+check on a long build, answer a blocked session, or kick something off from the bus.
+
+```sh
+cp hub-protocol.example.md ~/.claude/hub-protocol.md   # edit it — this is the hub's brief
+./hub
+```
+
+Full setup — creating the bot, the allowlist, the launchd pinger, and the gotchas
+(one `getUpdates` consumer per token, delivery ≠ handling) — is in
+**[docs/reach-your-fleet-from-your-phone.md](docs/reach-your-fleet-from-your-phone.md)**.
+The pinger has no dependency on crew; it works for anyone running the telegram plugin.
 
 ## Spaces & spatial restore (optional: spacetags)
 
