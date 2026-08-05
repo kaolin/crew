@@ -1,103 +1,139 @@
 # crew
 
-**htop + a remote for your fleet of Claude Code sessions.**
+**htop + a remote for the Claude Code sessions you already have open.**
 
-If you run many `claude` sessions by hand — scattered across terminal windows and
-macOS Spaces — crew gives you one place to *see* them, *drive* them, and bring them
-all back after a reboot. It does **not** spawn or own sessions (Claude Code's own
-Agent view does that, as do Claude Squad / Sculptor / vibe-kanban) — it **attaches to
-the ones you already have** and never touches your layout.
+If you keep a lot of `claude` sessions running by hand — scattered across terminal
+windows and macOS Spaces — crew gives you one place to *see* them, *drive* them, and
+bring them all back after a reboot.
 
-```mermaid
-flowchart LR
-    fleet["your running claudes<br/>(izzit · thereby · orrery …)"]
-    fleet -- "claude agents --json" --> crew{{crew}}
-    crew -- "status · peek · tell · jump" --> you(["you"])
-    crew -- "Space nav / restore (optional)" --> spacetags[("spacetags.app")]
 ```
+  5 sessions   ·   1 waiting   ·   2 busy   ·   2 idle
+
+  api   ~/src/api
+    ● waiting   api-4f       2d3h   ⟵ QUESTION FOR YOU
+    ○ idle      api-90       2d3h
+
+  web   ~/src/web
+    ▶ busy      web-1c       6h12m
+    ▶ busy      web-e7       6h12m   ⟵ at prompt (bg task)
+
+  infra   ~/src/infra
+    ○ idle      infra-b2     4d1h
+```
+
+Needs-you first: the session blocked on a question sorts above everything else, and
+`crew pending` will tell you what it's actually asking without switching to it.
+
+## What it is — and isn't
+
+crew does **not** spawn, own, or sandbox sessions. Claude Code's own Agent view does
+that, as do Claude Squad, Sculptor and vibe-kanban — most of which run sessions in
+their own tmux, git worktrees or containers.
+
+crew is the opposite bet: **your hand-arranged sessions are the source of truth.** It
+attaches to what's already running, never rearranges your windows, and stays a thin
+layer over `claude agents --json` + iTerm2. If you like tools that manage your sessions
+for you, one of the above is a better fit. If you've already got your fleet exactly how
+you want it and just want a console over it, that's this.
+
+**Requirements:** macOS, iTerm2, and the `claude` CLI at **≥ 2.1.139** (that's the
+version that added `claude agents --json`). tmux sessions are visible and drivable too;
+window/Space operations are iTerm2-only. Python 3 stdlib — no pip, no venv.
 
 ## Install
 
-```
+```sh
 brew install kaolin/tap/crew
 crew                          # your fleet, grouped by project, needs-you first
 brew services start crew      # optional: auto-snapshot every 5 min (reboot safety)
 ```
 
-From source instead: `git clone https://github.com/kaolin/crew && crew/crew setup`.
-macOS + iTerm2; uses the `claude` CLI (Claude Code).
+The formula installs the `crew` CLI. For the phone hub and the alert daemon — which are
+separate pieces that live in this repo — clone it instead:
 
-## What it does
+```sh
+git clone https://github.com/kaolin/crew && crew/crew setup
+```
+
+## Commands
 
 | command | what it does |
 |---|---|
 | `crew` · `crew status` | fleet overview, grouped by project, needs-you first |
-| `crew artifacts` | gallery of every live artifact URL your fleet has published |
 | `crew peek <name>` | read a session's recent conversation (any terminal; `--screen` for raw TUI) |
-| `crew pending [name]` | what every blocked session needs from you — questions vs permission prompts |
+| `crew pending [name]` | what a blocked session needs from you — a question vs a permission prompt |
 | `crew ask <name> "…"` | send a prompt and **wait for the reply** (round-trip) |
 | `crew tell <name> "…"` | fire-and-forget a prompt to an **idle** session |
 | `crew keys <name> down enter` | raw keystrokes, no Enter appended — drives multi-select pickers |
 | `crew at-prompt <name>` | exit 0 if it'll take input now (`busy` can just mean a background task) |
+| `crew artifacts` | every live artifact URL your fleet has published |
 | `crew jump <name>` | go to where its window *actually* is (+ front it) |
-| `crew goto <name>` | go to its *tagged* (intended) Space |
-| `crew where <name>` | show actual Space vs. tagged home |
+| `crew goto <name>` · `crew where <name>` | go to its *tagged* Space · show actual vs. tagged |
 | `crew snapshot` · `crew restore` | save / rebuild the whole layout across a reboot |
 | `crew setup` · `crew doctor` | install onto PATH + agent / health-check |
 
 `<name>` resolves by exact name, name-prefix, project, or substring.
 
+## Two things it knows that the raw status doesn't
+
+**`waiting` doesn't tell you who's blocked on what.** The CLI reports every blocked
+session as "permission prompt" — whether it's a tool asking to run `rm`, or a question
+meant for *you* with four options. `crew pending` reads the transcript (falling back to
+scraping the terminal, because the prompt often goes up before it's logged) and tells
+them apart. `crew keys` then answers a picker without submitting a half-filled form.
+
+**`busy` doesn't mean working.** A session stays busy for as long as *any* background
+shell or monitor is alive, long after the model has finished. crew scrapes for the
+difference — a live spinner and "esc to interrupt" mean a turn is running; their absence
+with an input box means it'll take your message right now — and marks those
+`⟵ at prompt (bg task)` instead of letting them look hung.
+
 ## How it works
 
-- **Awareness** — `claude agents --json` (Claude Code ≥ 2.1.139) reports every running
-  session, interactive ones included, with cwd / sessionId / name / live status. No
-  screen-scraping, no hooks.
+- **Awareness** — `claude agents --json` reports every running session, interactive ones
+  included, with cwd / sessionId / name / live status. No hooks, no wrapper process.
 - **Dispatch & jump** — resolve a session, join `pid → tty → the live iTerm2 session`,
-  and act in place via AppleScript (`write text` / `select` / `contents`).
+  and act in place via AppleScript.
 - **Reboot map** — a launchd agent snapshots the fleet every 5 min into
-  `~/.crew/latest.json` (shutdown-safe, keeps history in `~/.crew/history/`). After a
-  reboot, `crew restore --go` reopens, places, and resumes every session. Session
-  state lives on disk (`~/.claude/projects/…`), so nothing is lost.
+  `~/.crew/latest.json` (shutdown-safe, history in `~/.crew/history/`). After a reboot,
+  `crew restore --go` reopens, places and resumes every session. Conversation state
+  already lives on disk in `~/.claude/projects/`, so nothing is lost.
 
 ## Reach your fleet from your phone (optional)
 
 Run one session as a **hub**: Telegram messages from your phone land in it, it drives
-crew, and a launchd daemon pushes back "finished" and "needs you" alerts — so you can
-check on a long build, answer a blocked session, or kick something off from the bus.
+crew on your behalf, and a launchd daemon pushes back "finished" and "needs you" alerts.
+Useful for checking a long build, unblocking a session, or starting something while
+you're out.
 
 ```sh
 cp hub-protocol.example.md ~/.claude/hub-protocol.md   # edit it — this is the hub's brief
 ./hub
 ```
 
-Full setup — creating the bot, the allowlist, the launchd pinger, and the gotchas
-(one `getUpdates` consumer per token, delivery ≠ handling) — is in
+Both files ship in the repo, so this path needs the clone rather than the brew formula.
+Full setup — creating the bot, the allowlist, the launchd pinger — plus the two gotchas
+that cost real messages (Telegram allows exactly one `getUpdates` consumer per token;
+and delivery ≠ handling, which is why there's a separate `actioned.cursor`) is in
 **[docs/reach-your-fleet-from-your-phone.md](docs/reach-your-fleet-from-your-phone.md)**.
-The pinger has no dependency on crew; it works for anyone running the telegram plugin.
 
-## Spaces & spatial restore (optional: spacetags)
+The alert daemon has no dependency on crew — it only reads `claude agents --json` and
+the plugin's token file, so it works for anyone running the telegram plugin.
 
-crew keeps your macOS-Space layout by delegating all Space navigation to
-**[spacetags](https://spacetags.app/)** — a menubar app that labels each Space by
-project. crew maps a session to a Space by matching its project to the Space's tag,
-then spacetags switches there. Without spacetags, crew still does everything else —
-status, dispatch, and conversation restore — it just won't place windows on Spaces.
+## Spaces (optional)
 
-## Design: attach, don't spawn
-
-Every other tool in this space *owns* its sessions (its own tmux, git worktrees, or
-containers). crew is the opposite: it treats your existing, hand-arranged sessions as
-the source of truth and stays a thin layer over `claude agents --json` + iTerm2. It
-also stays cleanly separated from spacetags — crew is the *session* layer, spacetags
-is the *Space* layer, joined by one call.
+crew delegates all macOS-Space navigation to **[spacetags](https://spacetags.app/)**, a
+menubar app that labels each Space by project. crew maps a session to a Space by
+matching its project to the Space's tag; spacetags switches there. Without it crew still
+does everything else — status, dispatch, peek, and conversation restore — it just won't
+place windows on Spaces.
 
 ## Test
 
+```sh
+./test.sh                                        # fixtures; no live sessions needed
+for t in pinger/test_*.py; do python3 "$t"; done # the alert daemon's own suite
 ```
-./test.sh    # runs against fixtures — no live sessions needed
-```
-
-stdlib Python 3 only; no pip/conda env.
 
 ## License
 
