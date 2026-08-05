@@ -1,0 +1,37 @@
+#!/bin/sh
+# Launch a Claude Code session as the Telegram control hub for the fleet.
+# Bridges your phone (via your own Telegram bot) to crew-driven fleet ops.
+# Pairing/allowlist persists in ~/.claude/channels/telegram/ across restarts.
+#
+# Setup: see docs/reach-your-fleet-from-your-phone.md. Copy the example protocol
+# to ~/.claude/hub-protocol.md and edit it — that file is what tells the hub how
+# to behave.
+PROTOCOL="${HUB_PROTOCOL:-$HOME/.claude/hub-protocol.md}"
+
+# The example sits next to this script in a clone, or in share/crew once the
+# Homebrew formula has installed it.
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+EXAMPLE=""
+for cand in \
+  "$here/hub-protocol.example.md" \
+  "$here/../share/crew/hub-protocol.example.md"
+do
+  if [ -f "$cand" ]; then EXAMPLE="$cand"; break; fi
+done
+
+if [ ! -f "$PROTOCOL" ]; then
+  echo "crew-hub: no protocol at $PROTOCOL" >&2
+  if [ -n "$EXAMPLE" ]; then
+    echo "  cp \"$EXAMPLE\" \"$PROTOCOL\"   # then edit it" >&2
+  else
+    echo "  copy hub-protocol.example.md from the repo to \"$PROTOCOL\"" >&2
+  fi
+  echo "  …or point HUB_PROTOCOL at a protocol of your own." >&2
+  exit 1
+fi
+
+exec claude \
+  --name hub \
+  --channels plugin:telegram@claude-plugins-official \
+  --append-system-prompt "$(cat "$PROTOCOL")" \
+  "$@"

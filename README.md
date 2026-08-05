@@ -48,8 +48,8 @@ crew                          # your fleet, grouped by project, needs-you first
 brew services start crew      # optional: auto-snapshot every 5 min (reboot safety)
 ```
 
-The formula installs the `crew` CLI. For the phone hub and the alert daemon — which are
-separate pieces that live in this repo — clone it instead:
+Installs `crew` and `crew-hub`. The alert daemon (`pinger/`) ships in the repo only, so
+clone if you want that:
 
 ```sh
 git clone https://github.com/kaolin/crew && crew/crew setup
@@ -107,12 +107,13 @@ Useful for checking a long build, unblocking a session, or starting something wh
 you're out.
 
 ```sh
-cp hub-protocol.example.md ~/.claude/hub-protocol.md   # edit it — this is the hub's brief
-./hub
+crew-hub                      # tells you where the example protocol is
+cp <that path> ~/.claude/hub-protocol.md    # edit it — this is the hub's brief
+crew-hub                      # now it launches
 ```
 
-Both files ship in the repo, so this path needs the clone rather than the brew formula.
-Full setup — creating the bot, the allowlist, the launchd pinger — plus the two gotchas
+`crew-hub` ships in the formula alongside `crew`, so brew and clone installs both
+work. Full setup — creating the bot, the allowlist, the launchd pinger — plus the two gotchas
 that cost real messages (Telegram allows exactly one `getUpdates` consumer per token;
 and delivery ≠ handling, which is why there's a separate `actioned.cursor`) is in
 **[docs/reach-your-fleet-from-your-phone.md](docs/reach-your-fleet-from-your-phone.md)**.

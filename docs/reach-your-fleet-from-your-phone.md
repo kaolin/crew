@@ -116,7 +116,8 @@ Safety (do not skip):
 You are a remote control, not an autonomous agent. When in doubt, report and ask.
 ```
 
-The launcher — `$HOME/dev/crew/hub` (`chmod +x`):
+The launcher is `crew-hub`, which ships with crew — all it does is append that brief to
+a session's system prompt:
 
 ```sh
 #!/bin/sh
@@ -128,7 +129,15 @@ exec claude \
   "$@"
 ```
 
-Now `~/dev/crew/hub` starts a phone-reachable hub. From the phone: `status` → fleet summary; `peek project-a` → what it's doing; `tell project-a to run its tests` → the hub echoes the exact prompt and waits for your **YES** before sending. That confirm-gate is the difference between a remote control and a loaded gun.
+(The shipped version also resolves `$HUB_PROTOCOL` and fails with a useful message
+rather than starting brief-less, but that's the whole idea.)
+
+Run `crew-hub` and you have a phone-reachable hub. From the phone: `status` → fleet
+summary; `peek project-a` → what it's doing; `tell project-a to run its tests` → routed
+to that session. Decide your own confirm-gate policy in the brief — mine sends anything
+I dictated straight through, and confirms only for things the hub composed itself or
+anything destructive. Making yourself say YES to your own words is friction, not safety;
+making a hub confirm before it improvises is the part that matters.
 
 ### 3. The pinger (proactive alerts)
 
