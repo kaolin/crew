@@ -367,6 +367,41 @@ def _osa(script, *args):
 # only backend today; a tmux (or remote-over-ssh) backend drops in by implementing the
 # same four methods and teaching `adapter_for()` to route to it — nothing else changes.
 
+def settle_for(msg):
+    """How long to let a paste land before pressing Enter.
+
+    Submitting early truncates it, and nothing surfaces the loss — the send
+    reports success and the screen looks right; only the receiving session's
+    transcript shows the message beginning mid-word."""
+    return min(0.6 + len(msg) / 1200.0, 6.0)
+
+
+CHUNK = 600
+
+
+def chunks_of(msg, size=CHUNK):
+    """Split msg for delivery, preferring line boundaries.
+
+    One big write loses its FRONT — on 2026-08-06 a 1.15 KB relay arrived as
+    1018 chars starting mid-path, and simply waiting longer before Enter didn't
+    help, because the loss happens as the text goes in rather than at submit.
+    Short writes land whole, so send several instead of one."""
+    if len(msg) <= size:
+        return [msg]
+    out, buf = [], ""
+    for line in msg.splitlines(keepends=True):
+        while len(line) > size:                    # a single monster line
+            if buf:
+                out.append(buf); buf = ""
+            out.append(line[:size]); line = line[size:]
+        if len(buf) + len(line) > size:
+            out.append(buf); buf = ""
+        buf += line
+    if buf:
+        out.append(buf)
+    return out
+
+
 class ITerm2Adapter:
     """Drive the live iTerm2 session behind a tty via AppleScript."""
     name = "iTerm2"
@@ -377,12 +412,24 @@ class ITerm2Adapter:
         return None if "__NOTFOUND__" in out else out
 
     def tell(self, tty, msg):
-        """Type + submit msg into the session. For multi-line msg, let the paste
-        settle before the Enter so it isn't swallowed by bracketed paste."""
-        if "__OK__" not in _osa(_OSA_TYPE, tty, msg):
-            return False
-        if "\n" in msg:
-            time.sleep(0.6)
+        """Type + submit msg into the session, letting a long paste land first.
+
+        A flat 0.6s was enough for a short multi-line note and silently WRONG for
+        a long one: on 2026-08-06 two ~1.8 KB relays submitted mid-paste and
+        arrived beheaded, each starting mid-word. Claude Code had accepted only
+        what had streamed in by the time Enter fired, and neither the send nor
+        the screen showed anything amiss — the loss was only visible in the
+        receiving session's transcript.
+
+        So scale the wait with size, and cap it so a huge paste can't hang."""
+        parts = chunks_of(msg)
+        for i, part in enumerate(parts):
+            if "__OK__" not in _osa(_OSA_TYPE, tty, part):
+                return False
+            if i < len(parts) - 1:
+                time.sleep(0.35)                  # let each chunk register
+        if "\n" in msg or len(msg) > 400:
+            time.sleep(settle_for(msg))
         return "__OK__" in _osa(_OSA_SUBMIT, tty)
 
     def keys(self, tty, chunk):
@@ -431,7 +478,7 @@ class TmuxAdapter:
             # (raw newlines via send-keys -l can submit early); settle, then Enter.
             self._tmux("set-buffer", "-b", "crew_tell", msg)
             self._tmux("paste-buffer", "-d", "-p", "-b", "crew_tell", "-t", self.target)
-            time.sleep(0.6)
+            time.sleep(settle_for(msg))   # see ITerm2Adapter.tell — flat 0.6s beheaded long relays
         else:
             self._tmux("send-keys", "-t", self.target, "-l", msg)   # literal text, then submit
         return self._tmux("send-keys", "-t", self.target, "Enter").returncode == 0
@@ -796,6 +843,30 @@ def generating(rows):
     return False
 
 
+def prompt_text(s, rows=None):
+    """Whatever the input line shows, or "" if the box is bare.
+
+    DO NOT read this as "text the user typed". Claude Code renders a suggested
+    next message as ghost text in the same place, and a terminal scrape has no
+    styling to tell them apart. On 2026-08-06 this fooled us both: five sessions
+    were reported to kaolin as holding his unsent drafts, he said one "doesn't
+    sound like me", and a probe settled it — typing a single character replaced
+    the line entirely, so the box had been empty all along. Their transcripts
+    confirmed it: "commit all this" and "go ahead on the textures" were never
+    received by any session, and pressing Enter on them submitted nothing.
+
+    Real typed text does exist too ("man I wish I hadn't looked at ipad LOL"
+    was genuine and did submit). The only reliable discriminator found so far
+    is intrusive — type a character and see whether it appends or replaces —
+    so callers must not act on this value, only display it as unverified."""
+    rows = _screen_tail(s, lines=12) if rows is None else rows
+    for r in (rows or [])[-6:]:
+        t = r.strip()
+        if t.startswith("❯"):
+            return t[1:].strip()
+    return ""
+
+
 def at_prompt(s, rows=None):
     """True when the session is typeable right now — model idle, input box up.
 
@@ -808,10 +879,16 @@ def at_prompt(s, rows=None):
     The ❯ box alone does NOT mean idle — Claude Code keeps it up while
     generating so you can queue input (caught live against the hub itself,
     which reported "at prompt" mid-turn). So require the box *and* the absence
-    of any generating tell."""
+    of any generating tell.
+
+    The box counts whether or not it has text on it. Requiring a *bare* ❯ was
+    wrong: Claude Code puts a ghost suggestion there, which is not input and
+    doesn't stop the session accepting a message. That mistake stalled several
+    queued relays on 2026-08-06, each waiting for a box that would never look
+    empty."""
     rows = _screen_tail(s, lines=12) if rows is None else rows
     rows = rows or []
-    return any(r.strip() == "❯" for r in rows[-6:]) and not generating(rows)
+    return any(r.strip().startswith("❯") for r in rows[-6:]) and not generating(rows)
 
 
 def _pending_line(p):
@@ -1000,7 +1077,13 @@ def cmd_at_prompt(a):
     s, _ = _pick(a.name)
     if not s:
         sys.exit(2)
-    ready = at_prompt(s)
+    rows = _screen_tail(s, lines=12)
+    ready = at_prompt(s, rows)
+    shown = prompt_text(s, rows)
+    if ready and shown:
+        # Unverified: could be his typing or Claude Code's ghost suggestion.
+        print(f"{s.get('name')}: at prompt (input line shows, unverified: {shown!r})")
+        sys.exit(0)
     print(f"{s.get('name')}: " + ("at prompt" if ready else "not at prompt"))
     sys.exit(0 if ready else 1)
 

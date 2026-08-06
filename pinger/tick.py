@@ -624,12 +624,12 @@ def main():
             notified   = bool(p.get("notified_stuck"))
             if (NOTIFY_STUCK and not notified and not first_run
                     and name not in EXCLUDE_NAMES
-                    and (now - busy_since) >= STUCK_HOURS * 3600
+                    and (now - busy_since) >= STUCK_HOURS * 3600):
+                if not at_prompt_via_crew(name):
                     # Not hung if it's sitting at an empty prompt — that's a
                     # background shell holding the flag, not a stalled turn.
-                    and not at_prompt_via_crew(name)):
-                events.append(("⏳", name, proj, f"busy {(now-busy_since)/3600:.1f}h — may be hung", [], []))
-                notified = True
+                    events.append(("⏳", name, proj, f"busy {(now-busy_since)/3600:.1f}h — may be hung", [], []))
+                    notified = True
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
                         "busy_since": busy_since, "notified_stuck": notified}
         elif status == "waiting":
