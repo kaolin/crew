@@ -326,6 +326,16 @@ def pending_prompt(path, tail=400):
 CREW_BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "crew")
 
 
+def transcript_lines(tpath):
+    """Line count of a session's transcript — our marker for "has it said
+    anything new". Cheap, and monotonic within a session."""
+    try:
+        with open(tpath, "rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
 def at_prompt_via_crew(name, timeout=10):
     """True if `crew at-prompt <name>` says the session is typeable right now.
 
@@ -630,8 +640,38 @@ def main():
                     # background shell holding the flag, not a stalled turn.
                     events.append(("⏳", name, proj, f"busy {(now-busy_since)/3600:.1f}h — may be hung", [], []))
                     notified = True
+
+            # A session with a live background task NEVER returns to idle, so
+            # the busy->idle edge below never fires for it. orrery ran a
+            # persistent monitor and went 57 hours without a single "finished"
+            # ping while producing constantly (2026-08-06) — kaolin had to ask
+            # twice before any of it reached him. So detect the turn ending on
+            # the screen instead: an empty prompt plus new transcript output.
+            tpath  = transcript_path(s.get("cwd"), sid)
+            nlines = transcript_lines(tpath)
+            seen   = p.get("reported_lines")
+            since  = p.get("last_report") or busy_since
+            if seen is None:
+                # First sight: arm, don't fire. Stamp `since` to now rather than
+                # busy_since, or the first report would claim the whole busy
+                # episode as its duration ("finished after 3400m").
+                seen, since = nlines, now
+            elif (NOTIFY_FINISHED and not first_run
+                    and name not in EXCLUDE_NAMES
+                    and nlines > seen
+                    and (now - since) >= MIN_FINISHED_SECS
+                    # Screen check last: it shells out, so only pay for it once
+                    # we already know there is something new to report.
+                    and at_prompt_via_crew(name)):
+                gist  = last_gist(tpath)
+                shots = find_artifacts(tpath, since) if SEND_PHOTOS else []
+                events.append(("✅", name, proj,
+                               f"finished after {(now - since) / 60:.0f}m (bg task still running)",
+                               gist, shots))
+                seen, since = nlines, now
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
-                        "busy_since": busy_since, "notified_stuck": notified}
+                        "busy_since": busy_since, "notified_stuck": notified,
+                        "reported_lines": seen, "last_report": since}
         elif status == "waiting":
             # NOT finished — it's blocked ON KAOLIN and will sit there forever.
             # This used to fall through to the idle branch and get reported as
@@ -669,7 +709,13 @@ def main():
                 events.append(("✅", name, proj, f"finished after {mins:.0f}m", lines, shots))
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
                         "busy_since": None, "notified_stuck": False,
-                        "notified_waiting": False}
+                        "notified_waiting": False,
+                        # keep the screen-based path in step, so a session that
+                        # picks up a background task next turn doesn't re-report
+                        # everything it already sent from the idle edge
+                        "reported_lines": transcript_lines(
+                            transcript_path(s.get("cwd"), sid)),
+                        "last_report": now}
 
     save_state({"initialized": True, "updated": now, "sessions": new,
                 "tunnel_alerted": tunnel_alerted,
