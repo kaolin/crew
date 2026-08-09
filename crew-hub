@@ -8,15 +8,14 @@
 # to behave.
 PROTOCOL="${HUB_PROTOCOL:-$HOME/.claude/hub-protocol.md}"
 
-# The example sits next to this script in a clone, or in share/crew once the
-# Homebrew formula has installed it.
+# The example and the settings file sit next to this script in a clone, or in
+# share/crew once the Homebrew formula has installed them.
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 EXAMPLE=""
-for cand in \
-  "$here/hub-protocol.example.md" \
-  "$here/../share/crew/hub-protocol.example.md"
-do
-  if [ -f "$cand" ]; then EXAMPLE="$cand"; break; fi
+SETTINGS=""
+for dir in "$here" "$here/../share/crew"; do
+  [ -z "$EXAMPLE" ]  && [ -f "$dir/hub-protocol.example.md" ] && EXAMPLE="$dir/hub-protocol.example.md"
+  [ -z "$SETTINGS" ] && [ -f "$dir/hub-settings.json" ]       && SETTINGS="$dir/hub-settings.json"
 done
 
 if [ ! -f "$PROTOCOL" ]; then
@@ -30,8 +29,30 @@ if [ ! -f "$PROTOCOL" ]; then
   exit 1
 fi
 
+# Enable the Telegram plugin for THIS SESSION ONLY.
+#
+# Do not enable it in ~/.claude/settings.json. The plugin's .mcp.json spawns a
+# bun server in every session that has it; Telegram allows exactly one
+# getUpdates consumer per token; and each new server SIGTERMs whoever holds
+# bot.pid to claim the slot. With the plugin on globally, any other session
+# starting or reloading silently kills the hub's channel — the hub's tools
+# vanish mid-conversation and only a reload brings them back, until the next
+# session takes the token again (diagnosed 2026-08-08).
+#
+# --channels alone is NOT enough: it won't resolve a plugin that isn't enabled.
+SETTINGS_ARG=""
+if [ -n "$SETTINGS" ]; then
+  SETTINGS_ARG="--settings $SETTINGS"
+else
+  echo "crew-hub: warning — hub-settings.json not found next to this script." >&2
+  echo "  The Telegram plugin must be enabled somehow, and enabling it globally" >&2
+  echo "  lets any other session steal the token. See the note in this script." >&2
+fi
+
+# shellcheck disable=SC2086  # SETTINGS_ARG is two args or empty, by construction
 exec claude \
   --name hub \
+  $SETTINGS_ARG \
   --channels plugin:telegram@claude-plugins-official \
   --append-system-prompt "$(cat "$PROTOCOL")" \
   "$@"

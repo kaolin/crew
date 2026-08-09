@@ -1,0 +1,6 @@
+{
+  "_comment": "Loaded by crew-hub via --settings, so the Telegram plugin is enabled for the HUB SESSION ONLY. Do not enable telegram in ~/.claude/settings.json: the plugin's .mcp.json spawns a bun server in every session that has it, Telegram allows exactly one getUpdates consumer per token, and each new server SIGTERMs whoever holds bot.pid — so any other session silently kills the hub's channel.",
+  "enabledPlugins": {
+    "telegram@claude-plugins-official": true
+  }
+}
