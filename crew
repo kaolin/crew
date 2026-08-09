@@ -1073,9 +1073,20 @@ def cmd_pending(a):
 def cmd_at_prompt(a):
     """Exit 0 when the session is typeable right now. Lets the pinger tell a
     genuinely hung session from one that is only 'busy' because a background
-    shell outlived the turn."""
+    shell outlived the turn.
+
+    Exit codes are load-bearing — callers poll this in a loop:
+      0  typeable now
+      1  exists, but mid-turn — keep waiting
+      2  NO SUCH SESSION — stop waiting, it is never coming back
+
+    Anything polling `until at-prompt` must treat 2 as fatal. A watcher that
+    lumps 2 in with 1 waits forever on a name that no longer exists: a session
+    renamed disasteroids-bc -> disasteroids-b3 and a queued relay sat undeliverd
+    for an hour, silently (2026-08-08)."""
     s, _ = _pick(a.name)
     if not s:
+        print(f"{a.name}: no such session", file=sys.stderr)
         sys.exit(2)
     rows = _screen_tail(s, lines=12)
     ready = at_prompt(s, rows)
