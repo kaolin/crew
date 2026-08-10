@@ -1,0 +1,500 @@
+{
+ "generated": "2026-08-10T16:34:59",
+ "apps": [
+  {
+   "name": "A2V",
+   "bundle": "org.erif.a2v",
+   "appId": "1315427155",
+   "live": "2.1",
+   "onSale": true,
+   "territories": [
+    175,
+    175
+   ],
+   "queue": null,
+   "waitHours": null,
+   "draft": null,
+   "testflight": {
+    "version": "2.1",
+    "build": "187",
+    "age_h": 487.7,
+    "expires": "2026-10-19"
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "BabyPaints",
+   "bundle": "org.erif.babypaint",
+   "appId": "698390611",
+   "live": "2.0.0",
+   "onSale": true,
+   "territories": [
+    175,
+    175
+   ],
+   "queue": null,
+   "waitHours": null,
+   "draft": null,
+   "testflight": {
+    "version": "2.1.0",
+    "build": "59",
+    "age_h": 185.6,
+    "expires": "2026-10-31"
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "Cosmic Specks",
+   "bundle": "org.erif.orrery",
+   "appId": "6784808054",
+   "live": null,
+   "onSale": false,
+   "territories": null,
+   "queue": [
+    "1.0",
+    "WAITING_FOR_REVIEW"
+   ],
+   "waitHours": 89.4,
+   "draft": null,
+   "testflight": {
+    "version": "1.0",
+    "build": "11",
+    "age_h": 150.9,
+    "expires": "2026-11-02"
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "Crashteroids",
+   "bundle": "org.erif.Tapsteroids2",
+   "appId": "1470887727",
+   "live": "2.3",
+   "onSale": false,
+   "territories": [
+    175,
+    175
+   ],
+   "queue": null,
+   "waitHours": null,
+   "draft": null,
+   "testflight": {
+    "expired": true,
+    "last": "7",
+    "age_h": 37631.5
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "Cupid's Revenge",
+   "bundle": "org.erif.cupidsrevenge",
+   "appId": "6756465419",
+   "live": null,
+   "onSale": false,
+   "territories": null,
+   "queue": null,
+   "waitHours": null,
+   "draft": [
+    "1.0",
+    "PREPARE_FOR_SUBMISSION"
+   ],
+   "testflight": {
+    "expired": true,
+    "last": "1",
+    "age_h": 5285.1
+   },
+   "everSubmitted": false
+  },
+  {
+   "name": "Curiouser: Presence & Wonder",
+   "bundle": "com.kaolin.curiouser",
+   "appId": "6792061288",
+   "live": "1.3",
+   "onSale": true,
+   "territories": [
+    175,
+    175
+   ],
+   "queue": null,
+   "waitHours": null,
+   "draft": null,
+   "testflight": {
+    "version": "1.4",
+    "build": "12",
+    "age_h": 151.8,
+    "expires": "2026-11-02"
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "Disasteroids",
+   "bundle": "org.erif.Tapsteroids",
+   "appId": "597732296",
+   "live": "1.1.0",
+   "onSale": true,
+   "territories": [
+    175,
+    175
+   ],
+   "queue": null,
+   "waitHours": null,
+   "draft": [
+    "1.2.0",
+    "PREPARE_FOR_SUBMISSION"
+   ],
+   "testflight": {
+    "version": "1.2.0",
+    "build": "143",
+    "age_h": 41.4,
+    "expires": "2026-11-06"
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "FractRoam",
+   "bundle": "com.fractroam",
+   "appId": "1043441882",
+   "live": "2.0.1",
+   "onSale": true,
+   "territories": [
+    175,
+    175
+   ],
+   "queue": [
+    "2.1",
+    "WAITING_FOR_REVIEW"
+   ],
+   "waitHours": 76.8,
+   "draft": null,
+   "testflight": {
+    "version": "2.1",
+    "build": "12",
+    "age_h": 92.2,
+    "expires": "2026-11-04"
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "Hide and See",
+   "bundle": "org.erif.hiddengame",
+   "appId": "6799613741",
+   "live": null,
+   "onSale": false,
+   "territories": null,
+   "queue": null,
+   "waitHours": null,
+   "draft": [
+    "1.0",
+    "PREPARE_FOR_SUBMISSION"
+   ],
+   "testflight": null,
+   "everSubmitted": false
+  },
+  {
+   "name": "izzit",
+   "bundle": "org.erif.izzit",
+   "appId": "6759532807",
+   "live": "1.1.1",
+   "onSale": true,
+   "territories": [
+    175,
+    175
+   ],
+   "queue": null,
+   "waitHours": null,
+   "draft": null,
+   "testflight": {
+    "version": "1.1.1",
+    "build": "277",
+    "age_h": 571.2,
+    "expires": "2026-10-15"
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "LazyDial",
+   "bundle": "org.erif.lazydial",
+   "appId": "583217329",
+   "live": "1.0.2",
+   "onSale": false,
+   "territories": [
+    0,
+    175
+   ],
+   "queue": null,
+   "waitHours": null,
+   "draft": null,
+   "testflight": null,
+   "everSubmitted": true
+  },
+  {
+   "name": "Magic Messages",
+   "bundle": "org.erif.magicmessage",
+   "appId": "6797397373",
+   "live": null,
+   "onSale": false,
+   "territories": null,
+   "queue": [
+    "1.0",
+    "WAITING_FOR_REVIEW"
+   ],
+   "waitHours": 1.5,
+   "draft": null,
+   "testflight": {
+    "version": "1.0",
+    "build": "18",
+    "age_h": 3.4,
+    "expires": "2026-11-08"
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "Missile VR",
+   "bundle": "org.erif.VRMissileDefense",
+   "appId": "1085313735",
+   "live": "1.0.1",
+   "onSale": false,
+   "territories": [
+    175,
+    175
+   ],
+   "queue": null,
+   "waitHours": null,
+   "draft": [
+    "1.0.3",
+    "PREPARE_FOR_SUBMISSION"
+   ],
+   "testflight": {
+    "expired": true,
+    "last": "6",
+    "age_h": 89827.2
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "Naming Rattle",
+   "bundle": "org.erif.namingrattle",
+   "appId": "1128250908",
+   "live": null,
+   "onSale": false,
+   "territories": null,
+   "queue": null,
+   "waitHours": null,
+   "draft": [
+    "1.0",
+    "PREPARE_FOR_SUBMISSION"
+   ],
+   "testflight": {
+    "version": "1.0",
+    "build": "4",
+    "age_h": 1224.5,
+    "expires": "2026-09-18"
+   },
+   "everSubmitted": false
+  },
+  {
+   "name": "Saintify",
+   "bundle": "com.saintify.saintify",
+   "appId": "608804799",
+   "live": "1.1.0",
+   "onSale": true,
+   "territories": [
+    83,
+    175
+   ],
+   "queue": null,
+   "waitHours": null,
+   "draft": [
+    "2.0.0",
+    "PREPARE_FOR_SUBMISSION"
+   ],
+   "testflight": {
+    "version": "2.0.0",
+    "build": "15",
+    "age_h": 48.1,
+    "expires": "2026-11-06"
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "Sandpainting: Zen Sand Art",
+   "bundle": "org.erif.sandpainting",
+   "appId": "6797394433",
+   "live": null,
+   "onSale": false,
+   "territories": null,
+   "queue": [
+    "1.0",
+    "WAITING_FOR_REVIEW"
+   ],
+   "waitHours": 1.0,
+   "draft": null,
+   "testflight": {
+    "version": "1.0",
+    "build": "35",
+    "age_h": 1.3,
+    "expires": "2026-11-08"
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "Spot The Hustle",
+   "bundle": "org.erif.SpotTheHustle",
+   "appId": "880531375",
+   "live": "2.1.0",
+   "onSale": true,
+   "territories": [
+    175,
+    175
+   ],
+   "queue": [
+    "2.2.0",
+    "WAITING_FOR_REVIEW"
+   ],
+   "waitHours": 41.5,
+   "draft": null,
+   "testflight": {
+    "version": "2.2.0",
+    "build": "37",
+    "age_h": 48.0,
+    "expires": "2026-11-06"
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "thereby",
+   "bundle": "org.erif.thereby",
+   "appId": "6780101275",
+   "live": null,
+   "onSale": false,
+   "territories": null,
+   "queue": null,
+   "waitHours": null,
+   "draft": [
+    "1.0",
+    "PREPARE_FOR_SUBMISSION"
+   ],
+   "testflight": {
+    "version": "0.1.0",
+    "build": "75",
+    "age_h": 39.0,
+    "expires": "2026-11-07"
+   },
+   "everSubmitted": false
+  },
+  {
+   "name": "Timeful",
+   "bundle": "org.erif.timeful",
+   "appId": "1153735066",
+   "live": "1.3.2",
+   "onSale": true,
+   "territories": [
+    175,
+    175
+   ],
+   "queue": null,
+   "waitHours": null,
+   "draft": null,
+   "testflight": {
+    "version": "1.3.2",
+    "build": "76",
+    "age_h": 94.3,
+    "expires": "2026-11-04"
+   },
+   "everSubmitted": true
+  },
+  {
+   "name": "TumbleDots",
+   "bundle": "org.erif.tumbledots",
+   "appId": "506161940",
+   "live": "1.3.2",
+   "onSale": false,
+   "territories": [
+    175,
+    175
+   ],
+   "queue": null,
+   "waitHours": null,
+   "draft": null,
+   "testflight": null,
+   "everSubmitted": true
+  }
+ ],
+ "play": {
+  "com.fractroam": [
+   {
+    "track": "production",
+    "status": "completed",
+    "name": "3 (2.0.1)",
+    "codes": [
+     "3"
+    ]
+   },
+   {
+    "track": "alpha",
+    "status": "completed",
+    "name": "3 (2.0.1)",
+    "codes": [
+     "3"
+    ]
+   }
+  ],
+  "org.erif.izzit": [
+   {
+    "track": "production",
+    "status": "completed",
+    "name": "1.1.210",
+    "codes": [
+     "210"
+    ]
+   },
+   {
+    "track": "beta",
+    "status": "draft",
+    "name": null,
+    "codes": []
+   },
+   {
+    "track": "alpha",
+    "status": "completed",
+    "name": "1.1.209",
+    "codes": [
+     "209"
+    ]
+   },
+   {
+    "track": "internal",
+    "status": "completed",
+    "name": "1.1.210",
+    "codes": [
+     "210"
+    ]
+   }
+  ],
+  "org.erif.spotthehustle": [
+   {
+    "track": "alpha",
+    "status": "completed",
+    "name": "2.2.0",
+    "codes": [
+     "36"
+    ]
+   },
+   {
+    "track": "internal",
+    "status": "draft",
+    "name": "2.1.0",
+    "codes": [
+     "18"
+    ]
+   },
+   {
+    "track": "internal",
+    "status": "completed",
+    "name": "initial re-release test",
+    "codes": [
+     "17"
+    ]
+   }
+  ]
+ }
+}
