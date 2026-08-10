@@ -42,9 +42,18 @@ for a in sorted(apps, key=rank):
     tf = a["testflight"] or {}
     tf_cell = '<td class="dash">—</td>'
     if tf.get("build"):
-        ahead = a["live"] and tf.get("version") and tf["version"] != a["live"]
-        tf_cell = cell(f"{tf.get('version') or '?'} ({tf['build']})",
-                       (dur(tf.get("age_h")) or "") + (" · ahead" if ahead else ""), "m4")
+        # "ahead" on its own was ambiguous — ahead of what? Say which.
+        # A build that is also the one in review is the more useful fact,
+        # and it outranks being ahead of the store.
+        qb = a.get("queueBuild")
+        if qb and str(qb) == str(tf["build"]):
+            rel = "in review"
+        elif a["live"] and tf.get("version") and tf["version"] != a["live"]:
+            rel = "ahead of store"
+        else:
+            rel = ""
+        note = " · ".join(x for x in (dur(tf.get("age_h")), rel) if x)
+        tf_cell = cell(f"{tf.get('version') or '?'} ({tf['build']})", note, "m4")
     elif tf.get("expired"):
         tf_cell = cell("expired", f"last {tf.get('last')} · {dur(tf.get('age_h'))} ago", "m6")
 
@@ -67,29 +76,38 @@ for a in sorted(apps, key=rank):
         "<tr>"
         f'<td class="app">{esc(a["name"])}</td>'
         + sale
-        + cell(a["queue"][0] if a["queue"] else None,
+        + cell(f'{a["queue"][0]} ({a["queueBuild"]})' if a.get("queue") and a.get("queueBuild")
+               else (a["queue"][0] if a.get("queue") else None),
                dur(a["waitHours"]) + " waiting" if a["waitHours"] else None, "m2")
         + cell(a["draft"][0] if a["draft"] else None, None, "m3")
         + tf_cell
         + cell("never" if not a["everSubmitted"] else None, None, "m5")
         + "</tr>")
 
+# Play's tracks map onto the iOS columns: production is "on sale", the closed
+# tracks are where testers live, and a draft release is Play's "drafted".
+# Same left-to-right reading — most public first.
+PLAY_COLS = [("production", "m1"), ("beta", "m2"), ("alpha", "m4"), ("internal", "m3")]
+
 play_rows = []
-for pkg, rels in sorted(DATA.get("play", {}).items()):
-    live = [r for r in rels if r.get("status") == "completed"]
-    live.sort(key=lambda r: TRACK_ORDER.get(r["track"], 9))
-    if not live:
-        play_rows.append(f'<tr><td class="app">{esc(PLAY_LABEL.get(pkg, pkg))}</td>'
-                         f'<td colspan="2" class="dash">no released track</td></tr>')
-        continue
-    top = live[0]
-    others = ", ".join(f"{r['track']} v{','.join(map(str, r['codes']))}" for r in live[1:])
-    play_rows.append(
-        f'<tr><td class="app">{esc(PLAY_LABEL.get(pkg, pkg))}</td>'
-        f'<td><span class="mark {"m1" if top["track"] == "production" else "m3"}">'
-        f'{esc(top["track"])} v{esc(",".join(map(str, top["codes"])))}'
-        f'<span class="sub">{esc(top.get("name") or "")}</span></span></td>'
-        f'<td class="note2">{esc(others)}</td></tr>')
+for pkg, rels in sorted(DATA.get("play", {}).items(),
+                        key=lambda kv: PLAY_LABEL.get(kv[0], kv[0]).lower()):
+    cells = ""
+    for track, kind in PLAY_COLS:
+        here = [r for r in rels if r["track"] == track]
+        # A completed release is what's actually out on that track; a draft
+        # sitting there is not, and shouldn't read the same.
+        done = next((r for r in here if r.get("status") == "completed"), None)
+        pick = done or (here[0] if here else None)
+        if not pick:
+            cells += '<td class="dash">—</td>'
+            continue
+        codes = ",".join(map(str, pick["codes"])) or "—"
+        sub = pick.get("name") or ""
+        if pick.get("status") != "completed":
+            sub = f'{pick.get("status")}{" · " + sub if sub else ""}'
+        cells += cell(f'v{codes}', sub, kind if done else "m5")
+    play_rows.append(f'<tr><td class="app">{esc(PLAY_LABEL.get(pkg, pkg))}</td>{cells}</tr>')
 
 gen = datetime.datetime.fromisoformat(DATA["generated"])
 missing = [a["name"] for a in apps if a["name"] not in
@@ -168,12 +186,13 @@ open(OUT, "w").write(f"""<title>Store pipeline — {gen:%-d %b %Y}</title>
 
   <div>
     <h2>Google Play</h2>
-    <p class="hint">Separate account, separate tracks. Package names are case-sensitive and don’t
-      always match the iOS bundle id.</p>
+    <p class="hint">Same reading as above — most public on the left. Production is Play’s
+      “on sale”; the closed tracks are where testers are. A greyed cell is a draft, not a release.</p>
   </div>
   <div class="scroll"><table>
-    <thead><tr><th class="app">App</th><th class="c1">Furthest track</th>
-      <th class="c3">Also live on</th></tr></thead>
+    <thead><tr><th class="app">App</th><th class="c1">Production</th>
+      <th class="c2">Beta</th><th class="c4">Alpha</th>
+      <th class="c3">Internal</th></tr></thead>
     <tbody>{''.join(play_rows)}</tbody>
   </table></div>
 

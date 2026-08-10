@@ -114,8 +114,20 @@ def collect():
         queue = next(((v, s) for v, s in states if s in QUEUE_STATES), None)
         draft = next(((v, s) for v, s in states if s not in QUEUE_STATES and s not in SETTLED), None)
 
-        # queue age: the review submission, not the version's created date
+        # queue age: the review submission, not the version's created date.
+        # Also which BUILD is attached — "2.1 in review" doesn't say whether
+        # that's the build testers have.
         wait_h = None
+        queue_build = None
+        if queue:
+            qv = next((v for v in vs
+                       if v["attributes"]["versionString"] == queue[0]
+                       and v["attributes"]["appStoreState"] == queue[1]), None)
+            if qv:
+                st, d = call("GET", f"/appStoreVersions/{qv['id']}/build",
+                             params={"fields[builds]": "version"})
+                if st == 200:
+                    queue_build = ((d.get("data") or {}).get("attributes") or {}).get("version")
         if queue:
             subs = [r for r in paged("/reviewSubmissions",
                                      {"filter[app]": aid,
@@ -161,7 +173,8 @@ def collect():
 
         apps.append(dict(name=at["name"], bundle=at["bundleId"], appId=aid,
                          live=live, onSale=on_sale, territories=terr,
-                         queue=queue, waitHours=wait_h, draft=draft, testflight=tf,
+                         queue=queue, queueBuild=queue_build, waitHours=wait_h,
+                         draft=draft, testflight=tf,
                          everSubmitted=bool(live or queue)))
     return dict(generated=datetime.datetime.now().isoformat(timespec="seconds"),
                 apps=apps, play=play_tracks())
@@ -174,7 +187,8 @@ def signature(data):
     Compared through JSON, because a tuple written to disk reads back as a
     list — comparing the live objects reported all 20 apps as changed on every
     single run, which is the same as no detector at all."""
-    return json.dumps([[a["name"], a["live"], a["onSale"], a["queue"], a["draft"],
+    return json.dumps([[a["name"], a["live"], a["onSale"], a["queue"],
+                        a.get("queueBuild"), a["draft"],
                         (a["testflight"] or {}).get("build")] for a in data["apps"]],
                       sort_keys=True)
 
