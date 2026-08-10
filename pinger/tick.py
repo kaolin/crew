@@ -15,7 +15,7 @@ so these two transitions are the honest signals available.
 Sends one batched message per tick to every paired Telegram chat, straight
 through the bot API — independent of the hub session.
 """
-import calendar, json, os, re, subprocess, sys, time, urllib.request, urllib.parse
+import calendar, difflib, json, os, re, subprocess, sys, time, urllib.request, urllib.parse
 
 HOME        = os.path.expanduser("~")
 CLAUDE      = "/Users/kaolin/.local/bin/claude"
@@ -324,6 +324,29 @@ def pending_prompt(path, tail=400):
 
 
 CREW_BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "crew")
+
+
+SAME_REPORT_RATIO = 0.86   # difflib similarity above which two reports are "the same news"
+SAME_REPORT_QUIET = 6 * 3600   # ...but say something anyway if it has been this long
+
+
+def report_sig(lines):
+    """Comparable signature for a gist: prose only, no numbers, no timestamps.
+
+    A polling session says the same thing every few minutes with the clock
+    moved on — "still WAITING_FOR_REVIEW, checked 02:14" then "…02:19". Those
+    are one piece of news, and sending each one buries the reports that matter
+    (kaolin, 2026-08-10: "way too verbose and frequent")."""
+    text = " ".join(t for _, t in (lines or []))
+    text = re.sub(r"\d+", "", text.lower())
+    return " ".join(text.split())
+
+
+def same_news(a, b):
+    """True when two gists are the same report wearing a different clock."""
+    if not a or not b:
+        return False
+    return difflib.SequenceMatcher(None, a, b).ratio() >= SAME_REPORT_RATIO
 
 
 def transcript_lines(tpath):
@@ -664,14 +687,27 @@ def main():
                     # we already know there is something new to report.
                     and at_prompt_via_crew(name)):
                 gist  = last_gist(tpath)
-                shots = find_artifacts(tpath, since) if SEND_PHOTOS else []
-                events.append(("✅", name, proj,
-                               f"finished after {(now - since) / 60:.0f}m (bg task still running)",
-                               gist, shots))
-                seen, since = nlines, now
+                sig   = report_sig(gist)
+                prev_sig = p.get("last_sig")
+                quiet = (now - (p.get("last_sent") or 0)) >= SAME_REPORT_QUIET
+                if same_news(sig, prev_sig) and not quiet:
+                    # Same news as last time — a monitor re-reporting no change.
+                    # Advance the markers so it stays quiet until something
+                    # actually differs, but don't spend a message on it.
+                    seen, since = nlines, now
+                    last_sig, last_sent = prev_sig, p.get("last_sent")
+                else:
+                    shots = find_artifacts(tpath, since) if SEND_PHOTOS else []
+                    events.append(("✅", name, proj,
+                                   f"finished after {(now - since) / 60:.0f}m (bg task still running)",
+                                   gist, shots))
+                    seen, since = nlines, now
+                    last_sig, last_sent = sig, now
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
                         "busy_since": busy_since, "notified_stuck": notified,
-                        "reported_lines": seen, "last_report": since}
+                        "reported_lines": seen, "last_report": since,
+                        "last_sig": locals().get("last_sig", p.get("last_sig")),
+                        "last_sent": locals().get("last_sent", p.get("last_sent"))}
         elif status == "waiting":
             # NOT finished — it's blocked ON KAOLIN and will sit there forever.
             # This used to fall through to the idle branch and get reported as
