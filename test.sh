@@ -184,6 +184,14 @@ assert m._blocked_refusal({'name':'n','status':'waiting'},'send') is True
 print('  blocked-session detection + tell guard OK')
 " || fail "blocked-session handling wrong"
 
+echo "== pinger suites =="
+# These lived beside tick.py and had to be remembered individually, so a broken
+# one could sit green-by-omission. Globbed instead of listed: a new test_*.py
+# next to the pinger is picked up without editing this file.
+for t in pinger/test_*.py; do
+  python3 "$t" || fail "$t"
+done
+
 echo "== doctor runs; setup --dry-run changes nothing =="
 ./crew doctor >/dev/null || fail "doctor errored"
 sdry=$(./crew setup --dry-run)

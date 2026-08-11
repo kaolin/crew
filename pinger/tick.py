@@ -376,6 +376,33 @@ def at_prompt_via_crew(name, timeout=10):
     return out.returncode == 0
 
 
+def busy_clock(busy_since, now, at_prompt, notified,
+               notify=True, first_run=False, excluded=False):
+    """What this tick means for a session `claude agents --json` still calls busy.
+
+    Returns (alert, busy_since, notified).
+
+    That status stays busy for as long as any background shell lives, so it
+    never returns to idle and the busy clock can only ever grow. fusiontrainer
+    was announced as "busy 3.7h — may be hung" nine minutes into a turn, having
+    finished several turns in between (2026-08-11; kaolin: "Probably not,
+    right?"). An empty prompt is the real turn boundary, so seeing one restarts
+    the clock — and clears `notified`, or one false alert would silence every
+    real hang afterwards for a session that never goes idle.
+
+    `at_prompt=None` means "we didn't look" — the screen scrape costs a
+    subprocess, so callers only pay for it when the answer can change something.
+    """
+    if at_prompt is None:
+        return False, busy_since, notified
+    if at_prompt:
+        return False, now, False
+    due = (now - busy_since) >= STUCK_HOURS * 3600
+    if notify and not first_run and not excluded and not notified and due:
+        return True, busy_since, True
+    return False, busy_since, notified
+
+
 def pending_via_crew(name, timeout=10):
     """Ask `crew pending <name>` — it can scrape the live terminal, which we can't
     from launchd, so it sees prompts the transcript hasn't logged. [] on any
@@ -655,14 +682,18 @@ def main():
         if status == "busy":
             busy_since = p.get("busy_since") if p.get("status") == "busy" and p.get("busy_since") else now
             notified   = bool(p.get("notified_stuck"))
-            if (NOTIFY_STUCK and not notified and not first_run
-                    and name not in EXCLUDE_NAMES
-                    and (now - busy_since) >= STUCK_HOURS * 3600):
-                if not at_prompt_via_crew(name):
-                    # Not hung if it's sitting at an empty prompt — that's a
-                    # background shell holding the flag, not a stalled turn.
-                    events.append(("⏳", name, proj, f"busy {(now-busy_since)/3600:.1f}h — may be hung", [], []))
-                    notified = True
+            # Only scrape the screen once the timer says the answer matters —
+            # either to alert, or to discover the timer was measuring a
+            # background shell and restart it.
+            due = (now - busy_since) >= STUCK_HOURS * 3600
+            looked = at_prompt_via_crew(name) if (
+                NOTIFY_STUCK and not first_run and name not in EXCLUDE_NAMES and due) else None
+            alert, busy_since, notified = busy_clock(
+                busy_since, now, looked, notified, notify=NOTIFY_STUCK,
+                first_run=first_run, excluded=name in EXCLUDE_NAMES)
+            if alert:
+                events.append(("⏳", name, proj,
+                               f"busy {(now-busy_since)/3600:.1f}h — may be hung", [], []))
 
             # A session with a live background task NEVER returns to idle, so
             # the busy->idle edge below never fires for it. orrery ran a
@@ -686,6 +717,11 @@ def main():
                     # Screen check last: it shells out, so only pay for it once
                     # we already know there is something new to report.
                     and at_prompt_via_crew(name)):
+                # Getting here means the screen check passed, so the turn is
+                # over and only a background shell keeps the status busy. That
+                # is the same boundary the stuck timer needs — restart it here
+                # too, or it keeps counting across every turn that follows.
+                busy_since, notified = now, False
                 gist  = last_gist(tpath)
                 sig   = report_sig(gist)
                 prev_sig = p.get("last_sig")
