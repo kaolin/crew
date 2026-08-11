@@ -97,6 +97,26 @@ def get_sessions():
         return None
 
 
+def usable_sessions(rows):
+    """Keep the rows we can actually reason about; count the rest.
+
+    Returns (sessions, skipped). `claude agents --json` has handed back rows
+    with no `status` field (2026-08-07), and the per-row unpack raised KeyError
+    out of the whole tick — so ONE malformed row cost every other session its
+    alerts for that cycle, silently, four times over.
+
+    A row with no status is skipped rather than defaulted: calling it idle
+    invents a finished turn, calling it busy starts a hang timer, and both lie.
+    """
+    good, skipped = [], 0
+    for s in rows or []:
+        if isinstance(s, dict) and s.get("sessionId") and s.get("name") and s.get("status"):
+            good.append(s)
+        else:
+            skipped += 1
+    return good, skipped
+
+
 def send(token, chat, text, parse_mode=None):
     fields = {"chat_id": chat, "text": text}
     if parse_mode:
@@ -669,6 +689,10 @@ def main():
         state["updated"] = now
         save_state(state)
         return  # transient; launchd will retry next interval
+
+    sessions, skipped = usable_sessions(sessions)
+    if skipped:
+        log(f"skipped {skipped} malformed session row(s) with no id/name/status")
 
     prev  = state.get("sessions", {})
     first_run = not state.get("initialized")
