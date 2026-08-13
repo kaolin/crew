@@ -6,6 +6,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = json.load(open(os.path.join(HERE, "status.json")))
 OUT = os.path.join(HERE, "status.html")
 
+# Hand-maintained next-steps. Optional: the page still renders without it, just
+# without the "What's next" section. Everything else here comes from an API;
+# this is the part only a person knows.
+try:
+    NOTES = json.load(open(os.path.join(HERE, "notes.json")))
+except (OSError, ValueError):
+    NOTES = {"apps": {}, "_STAGES": {}}
+
 PLAY_LABEL = {"com.fractroam": "FractRoam", "org.erif.izzit": "izzit",
               "org.erif.spotthehustle": "Spot The Hustle"}
 TRACK_ORDER = {"production": 0, "beta": 1, "alpha": 2, "internal": 3}
@@ -29,6 +37,56 @@ def cell(mark=None, sub=None, kind="m1"):
 
 
 apps = DATA["apps"]
+
+
+def update_in_flight(a):
+    """TestFlight carrying a newer marketing version than what's on sale.
+
+    kaolin's framing (2026-08-13): an update in progress IS a submission in
+    progress. Derived rather than hand-listed in notes.json, so it can't go
+    stale — the day 2.1.0 goes live, BabyPaints stops being 'in flight' with
+    no edit anywhere.
+    """
+    tf = a.get("testflight") or {}
+    return bool(a.get("onSale") and tf.get("version") and a.get("live")
+                and tf["version"] != a["live"])
+
+
+def build_nextsteps():
+    """The 'What's next' list: API-derived stage, human-written action."""
+    notes, stages = NOTES.get("apps", {}), NOTES.get("_STAGES", {})
+    if not notes:
+        return ""
+    buckets = {}
+    for a in apps:
+        n = notes.get(a["name"])
+        if not n:
+            continue
+        stage = str(n.get("stage", 6))
+        # An app the notes call "shipped" but whose TestFlight is ahead of the
+        # store is really mid-submission; trust the API over the note.
+        if stage == "6" and update_in_flight(a):
+            stage = "3"
+        buckets.setdefault(stage, []).append((a, n))
+
+    out = ['<div><h2>What\'s next</h2><p class="hint">Ordered by how close each is '
+           'to being out of your hands. An update in flight counts as a '
+           'submission in progress — the stage is derived from TestFlight vs '
+           'store, the action is written by hand.</p></div>']
+    for stage in sorted(buckets):
+        out.append(f'<div class="stage"><h3>{esc(stages.get(stage, stage))}'
+                   f'<span class="cnt">{len(buckets[stage])}</span></h3>')
+        for a, n in sorted(buckets[stage], key=lambda p: p[0]["name"].lower()):
+            flight = ('<span class="mark m4">update in flight</span>'
+                      if update_in_flight(a) else "")
+            do = (f'<p class="do">{esc(n["do"])}</p>' if n.get("do")
+                  else '<p class="do none">Nothing — it\'s out of your hands.</p>')
+            why = f'<p class="why">{esc(n["why"])}</p>' if n.get("why") else ""
+            out.append(f'<div class="step"><div class="steptop">'
+                       f'<span class="stepname">{esc(a["name"])}</span>{flight}</div>'
+                       f'{do}{why}</div>')
+        out.append("</div>")
+    return "\n".join(out)
 
 
 def rank(a):
@@ -113,6 +171,8 @@ gen = datetime.datetime.fromisoformat(DATA["generated"])
 missing = [a["name"] for a in apps if a["name"] not in
            ("FractRoam", "izzit", "Spot The Hustle")]
 
+nextsteps = build_nextsteps()
+
 open(OUT, "w").write(f"""<title>Store pipeline — {gen:%-d %b %Y}</title>
 <style>
   :root {{
@@ -166,6 +226,18 @@ open(OUT, "w").write(f"""<title>Store pipeline — {gen:%-d %b %Y}</title>
   .sub{{display:block;font-size:10.5px;font-weight:500;opacity:.85;letter-spacing:0}}
   .dash{{color:var(--ink-3);opacity:.4;font-size:13px}}
   .note2{{font-size:12px;color:var(--ink-3)}}
+  .stage{{margin-top:18px}}
+  h3{{margin:0 0 9px;font-size:11px;letter-spacing:.075em;text-transform:uppercase;
+    color:var(--ink-3);font-weight:700;display:flex;align-items:center;gap:8px}}
+  h3 .cnt{{background:var(--never-bg);color:var(--ink-3);border-radius:20px;
+    padding:1px 7px;font-size:10.5px;letter-spacing:0}}
+  .step{{background:var(--card);border:1px solid var(--edge);border-radius:9px;
+    padding:12px 14px;margin-bottom:8px}}
+  .steptop{{display:flex;flex-wrap:wrap;gap:9px;align-items:baseline;margin-bottom:5px}}
+  .stepname{{font-weight:640;font-size:15px}}
+  .do{{margin:0;font-size:14px;font-weight:520}}
+  .do.none{{font-weight:400;color:var(--ink-3)}}
+  .why{{margin:5px 0 0;font-size:13px;color:var(--ink-2);line-height:1.5}}
   footer{{border-top:1px solid var(--rule);padding-top:13px;font-size:12.5px;color:var(--ink-3);
     display:flex;flex-direction:column;gap:5px}}
   footer b{{color:var(--ink-2)}}
@@ -195,6 +267,8 @@ open(OUT, "w").write(f"""<title>Store pipeline — {gen:%-d %b %Y}</title>
       <th class="c3">Internal</th></tr></thead>
     <tbody>{''.join(play_rows)}</tbody>
   </table></div>
+
+  {nextsteps}
 
   <footer>
     <div><b>“On sale” is the public storefront, not App Store Connect.</b> A delisted app keeps
