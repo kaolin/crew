@@ -26,6 +26,11 @@ LOG_PATH    = f"{HOME}/dev/crew/pinger/pinger.log"
 INBOUND_LOG    = f"{HOME}/.claude/channels/telegram/inbound.jsonl"
 INBOUND_CURSOR = f"{HOME}/.claude/channels/telegram/inbound.cursor"
 BOT_PID_FILE   = f"{HOME}/.claude/channels/telegram/bot.pid"
+# The hub can only be woken by kaolin, so a Telegram push it never sees is a
+# dead end: every event also lands here, and `crew brief` replays what the hub
+# has not yet acknowledged. Durable queue, no new transport.
+STATUS_DIR     = f"{HOME}/.claude/status"
+STATUS_QUEUE   = f"{STATUS_DIR}/_pinger.jsonl"
 
 # --- tunables ---------------------------------------------------------------
 NOTIFY_FINISHED   = True
@@ -34,6 +39,16 @@ NOTIFY_WAITING    = True       # session blocked on a question/permission prompt
                                # (it never un-blocks on its own; silence = lost hours)
 MIN_FINISHED_SECS = 120        # only ping "finished" for busy episodes >= this
 STUCK_HOURS       = 3.0        # busy this long with no change -> "may be hung"
+NOTIFY_STALLED    = True       # the opposite blind spot: a session sitting IDLE while it
+                               # still owns open hubnotes. "finished" and "stuck" both only
+                               # watch BUSY sessions, so nobody-is-working-on-this was
+                               # invisible — thereby-b9 sat on five of kaolin's reports for
+                               # a day and the hub filed them as waiting on HIM.
+                               # (kaolin asked for a 5-min brief timer 2026-09-01; this is
+                               # the same catch without a heartbeat that trains you to
+                               # ignore it.)
+STALLED_MINS      = 30.0       # idle this long WITH open notes -> ping once
+HUBNOTES_LEDGER   = f"{HOME}/.claude/status/_hubnotes.jsonl"
 EXCLUDE_NAMES     = {"hub"}     # sessions to never ping about (the hub itself)
 QUIET_HOURS       = None       # e.g. (23, 8) to mute 23:00-08:00 local; None = off
 TUNNEL_STALL_SECS = 120        # inbound queued-but-undelivered longer than this -> tunnel is down
@@ -46,7 +61,10 @@ GIST_CHARS        = 12000     # max chars of the closing message; batched across
                               # mid-list is useless on a phone (kaolin, 2026-07-31)
 MIN_GIST_CHARS    = 80         # ignore short acks ("On it.") when picking the gist
 SEND_PHOTOS       = True       # attach screenshots/renders the session just wrote
-MAX_ARTIFACTS     = 3          # photos per finished session
+MAX_ARTIFACTS     = 8          # photos per finished session. Was 3; kaolin 2026-08-26
+                               # ("Yes please") - a full store set is 7 frames and 3 silently
+                               # dropped the rest. Still a cap, not a dump: sessions that write
+                               # 40-shot journey runs are trimmed on purpose.
 MAX_PHOTO_BYTES   = 9 * 1024 * 1024      # Telegram sendPhoto ceiling is 10MB
 ARTIFACT_SLACK    = 300        # secs before busy_since a file may have been written
 TAIL_LINES        = 400       # transcript lines to scan for artifact paths (episode-filtered)
@@ -396,6 +414,64 @@ def at_prompt_via_crew(name, timeout=10):
     return out.returncode == 0
 
 
+def session_status(name):
+    """A session's own end-of-turn status file, or {}. Never raises — this is
+    enrichment, and a malformed file must not cost kaolin his alert."""
+    for cand in (name, name.rsplit("-", 1)[0]):
+        p = os.path.join(STATUS_DIR, cand + ".json")
+        try:
+            return json.load(open(p, encoding="utf-8"))
+        except Exception:
+            continue
+    return {}
+
+
+def status_headline(st):
+    """One line lifted from the session's own words: what kaolin has to do, or
+    what it is waiting on. Turns 'session finished' into something actionable."""
+    if not isinstance(st, dict):
+        return ""
+    for key, label in (("needs_decision", "needs you"), ("your_move", "needs you"),
+                       ("blockers", "blocked"), ("blocked_on", "blocked")):
+        v = st.get(key)
+        if isinstance(v, str) and v.strip():
+            return f"{label}: {v.strip()[:120]}"
+        if isinstance(v, list) and v:
+            extra = f" (+{len(v) - 1} more)" if len(v) > 1 else ""
+            return f"{label}: {str(v[0])[:120]}{extra}"
+    return ""
+
+
+def queue_event(seq, kind, name, proj, extra, headline):
+    """Append one event to the durable queue. Best-effort by design."""
+    try:
+        os.makedirs(STATUS_DIR, exist_ok=True)
+        rec = {"seq": seq, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+               "kind": kind, "session": name, "project": proj,
+               "text": (extra + (" — " + headline if headline else ""))}
+        with open(STATUS_QUEUE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception as e:
+        log(f"queue append failed: {e}")
+
+
+def queue_next_seq():
+    try:
+        with open(STATUS_QUEUE, encoding="utf-8") as f:
+            last = 0
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    last = max(last, json.loads(ln).get("seq", 0))
+                except Exception:
+                    pass
+            return last + 1
+    except OSError:
+        return 1
+
+
 def busy_clock(busy_since, now, at_prompt, notified,
                notify=True, first_run=False, excluded=False):
     """What this tick means for a session `claude agents --json` still calls busy.
@@ -522,6 +598,63 @@ def send_photo(token, chat, path, caption=""):
     except Exception as e:                      # noqa: BLE001
         log(f"sendPhoto {os.path.basename(path)} to {chat} failed: {e}")
         return False
+
+
+def open_notes_by_app():
+    """{app: [text, ...]} for hubnotes still in state 'open'.
+
+    Last write per id wins, mirroring hubnotes.py's own list. Missing or
+    unreadable ledger is not an error — it just means no stall detection.
+    """
+    latest = {}
+    try:
+        with open(HUBNOTES_LEDGER, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("id") is not None:
+                    latest[r["id"]] = r
+    except OSError:
+        return {}
+    out = {}
+    for r in latest.values():
+        if r.get("state") != "open":
+            continue
+        out.setdefault(r.get("app") or "?", []).append(r.get("text") or "")
+    return out
+
+
+# Repo directory != app name for several projects, and the two that differ are
+# the two most active ports — without this the rule silently skips them.
+NOTES_ALIASES = {
+    "autostereogram": "magicmessages",
+    "fusiontrainer":  "hideandsee",
+    "orrery":         "cosmicspecks",
+    "mindfulpresence": "curiouser",
+    "erif-html":      "erif",
+    "erif_html":      "erif",
+}
+
+
+def notes_app_for(name, cwd):
+    """Map a session to its hubnotes app key.
+
+    The ledger is keyed by app ('sandpainting'), sessions by name
+    ('sandpainting-a8') and cwd ('/Users/kaolin/dev/Sandpainting'). Match on a
+    lowercased prefix of the session name, then the directory, so a rename of
+    either does not silently disable the rule.
+    """
+    stem = re.sub(r"-[0-9a-z]{2}$", "", (name or "").lower())
+    cand = {stem, stem.replace("-", ""),
+            os.path.basename(cwd or "").lower(),
+            os.path.basename(cwd or "").lower().replace("_", "")}
+    cand = {c for c in cand if c}
+    return cand | {NOTES_ALIASES[c] for c in cand if c in NOTES_ALIASES}
 
 
 def load_state():
@@ -696,6 +829,7 @@ def main():
 
     prev  = state.get("sessions", {})
     first_run = not state.get("initialized")
+    open_notes = open_notes_by_app() if NOTIFY_STALLED else {}
 
     events, new = [], {}
     for s in sessions:
@@ -803,9 +937,31 @@ def main():
                 lines = last_gist(tpath)
                 shots = find_artifacts(tpath, p["busy_since"]) if SEND_PHOTOS else []
                 events.append(("✅", name, proj, f"finished after {mins:.0f}m", lines, shots))
+            # STALLED: idle, and still owns open hubnotes. Fires ONCE and then
+            # stays quiet until the session moves again — a repeating nag is one
+            # you learn to ignore, which is the failure this rule exists to fix.
+            idle_since = (p.get("idle_since") or now) if p.get("status") == "idle" else now
+            stall_done = bool(p.get("notified_stalled"))
+            if (NOTIFY_STALLED and not first_run and name not in EXCLUDE_NAMES
+                    and not stall_done
+                    and (now - idle_since) >= STALLED_MINS * 60):
+                keys = notes_app_for(name, s.get("cwd"))
+                mine = [txt for app, texts in open_notes.items() if app in keys
+                        for txt in texts]
+                if mine:
+                    body = [(False, t[:150]) for t in mine[:4]]
+                    if len(mine) > 4:
+                        body.append((False, f"… and {len(mine) - 4} more"))
+                    events.append(("🌙", name, proj,
+                                   f"idle {(now - idle_since) / 60:.0f}m with "
+                                   f"{len(mine)} open note(s) — nobody is on this",
+                                   body, []))
+                    stall_done = True
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
                         "busy_since": None, "notified_stuck": False,
                         "notified_waiting": False,
+                        "idle_since": idle_since,
+                        "notified_stalled": stall_done,
                         # keep the screen-based path in step, so a session that
                         # picks up a background task next turn doesn't re-report
                         # everything it already sent from the idle edge
@@ -818,6 +974,16 @@ def main():
                 "poller_alerted": poller_alerted,
                 "poller_dead_since": poller_dead_since})
 
+    # Queue FIRST, and regardless of quiet hours or send success — the queue is
+    # what survives a hub that was not listening.
+    seq = queue_next_seq()
+    headlines = {}
+    for kind, name, proj, extra, lines, ps in events:
+        h = status_headline(session_status(name))
+        headlines[name] = h
+        queue_event(seq, kind, name, proj, extra, h)
+        seq += 1
+
     if events and not in_quiet_hours(now):
         token, chats = load_token(), load_chats()
         stamp = time.strftime("%H:%M", time.localtime(now))
@@ -826,8 +992,12 @@ def main():
             # One message PER APP (not one batched "crew" blob), each self-headed
             # with source + a visible timestamp: "✅ babypaints-08 (BabyPaints) · 08:15 · finished…"
             for kind, name, proj, extra, lines, ps in events:
-                head_plain = f"{kind} {name} ({proj}) · {stamp} · {extra}"
-                head_md = f"{kind} *{md_escape(name)}* \\({md_escape(proj)}\\) · {md_escape(stamp)} · {md_escape(extra)}"
+                hl = headlines.get(name) or ""
+                tail = f" · {hl}" if hl else ""
+                head_plain = f"{kind} {name} ({proj}) · {stamp} · {extra}{tail}"
+                head_md = (f"{kind} *{md_escape(name)}* \\({md_escape(proj)}\\) · "
+                           f"{md_escape(stamp)} · {md_escape(extra)}"
+                           + (f" · {md_escape(hl)}" if hl else ""))
                 send_chunked(token, c,
                              split_report(head_md, lines, escape=True),
                              split_report(head_plain, lines),
