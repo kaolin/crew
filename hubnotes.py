@@ -88,15 +88,25 @@ def _fmt(r, now):
 
 def cmd_list(a):
     now = time.time()
-    rows = [r for r in _rows() if r.get("state") == "open"]
+    allrows = _rows()
     if a.app:
-        rows = [r for r in rows if r.get("app") == a.app]
+        allrows = [r for r in allrows if r.get("app") == a.app]
+    rows = [r for r in allrows if r.get("state") == "open"]
+    shelved = [r for r in allrows if r.get("state") == "stale"]
     if not rows:
         print("nothing open")
-        return
-    print("%d open" % len(rows))
-    for r in rows:
-        print(_fmt(r, now))
+    else:
+        print("%d open" % len(rows))
+        for r in rows:
+            print(_fmt(r, now))
+    # Shelved notes are hidden from the pinger, not from people. Omitting them
+    # here turned the anti-nag device into an amnesia device: two fixed notes and
+    # one containing a decision kaolin owed sat as neither open nor done until a
+    # session went looking (thereby-8e, 2026-09-03). Always show the count and ids.
+    if shelved:
+        print("%d shelved (no nag; `unshelve <id>` to revive)" % len(shelved))
+        for r in shelved:
+            print(_fmt(r, now))
 
 
 def cmd_all(a):
@@ -147,7 +157,7 @@ def cmd_shelve(a):
     Not closed: closing needs evidence, and there is none."""
     now = time.time()
     rows = _rows()
-    n = 0
+    done, refused = [], []
     for r in rows:
         if r.get("state") != "open":
             continue
@@ -157,13 +167,52 @@ def cmd_shelve(a):
             t = time.mktime(time.strptime(r["sent"], "%Y-%m-%d %H:%M"))
         except Exception:
             continue
-        if now - t >= a.older * 3600:
-            r["state"] = "stale"
-            r["shelved"] = _stamp()
-            n += 1
-    if n:
+        if now - t < a.older * 3600:
+            continue
+        # Refuse when the app has moved since the note was filed: its status file
+        # is newer than the note, so the note may already be fixed and needs
+        # closing with evidence, not hiding. (#58/#59 were fixed three days before
+        # a blanket shelve buried them, 2026-09-03.) --force overrides.
+        touched = _app_touched_since(r.get("app"), t)
+        if touched and not a.force:
+            refused.append((r, touched))
+            continue
+        r["state"] = "stale"
+        r["shelved"] = _stamp()
+        done.append(r)
+    if done:
         _write(rows)
-    print("shelved %d note(s) open longer than %dh%s" % (n, a.older, (" in " + a.app) if a.app else ""))
+    print("shelved %d note(s) open longer than %dh%s" % (len(done), a.older, (" in " + a.app) if a.app else ""))
+    for r in done:
+        print(_fmt(r, now))
+    if refused:
+        print("refused %d — the app has a status file newer than the note; close with evidence or --force:" % len(refused))
+        for r, when in refused:
+            print(_fmt(r, now) + "\n        → app status updated %s" % when)
+
+
+def _app_touched_since(app, since_epoch):
+    """The app's ~/.claude/status/<app>.json updated_at, if it is newer than the
+    note; else None. Best effort — no file, no opinion."""
+    if not app:
+        return None
+    path = os.path.join(os.path.dirname(LEDGER), app + ".json")
+    try:
+        d = json.load(io.open(path, encoding="utf-8"))
+        s = str(d.get("updated_at") or "").strip()
+        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                if fmt.endswith("%z"):
+                    import datetime as _dt
+                    ts = _dt.datetime.strptime(s, fmt).timestamp()
+                else:
+                    ts = time.mktime(time.strptime(s[:19], fmt))
+                return s if ts > since_epoch else None
+            except ValueError:
+                continue
+    except Exception:
+        return None
+    return None
 
 
 def cmd_unshelve(a):
@@ -232,6 +281,7 @@ def main():
 
     p = sub.add_parser("shelve", help="mark open notes older than N hours stale (kept, but no longer nag)")
     p.add_argument("--older", type=int, default=168, help="hours (default 168 = a week)")
+    p.add_argument("--force", action="store_true", help="shelve even if the app has moved since the note")
     p.add_argument("app", nargs="?")
     p.set_defaults(fn=cmd_shelve)
 
