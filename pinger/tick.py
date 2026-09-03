@@ -862,6 +862,11 @@ def main():
     prev  = state.get("sessions", {})
     first_run = not state.get("initialized")
     open_notes = open_notes_by_app() if NOTIFY_STALLED else {}
+    # The "already nagged about exactly this set" memory lives per APP, not per
+    # session: a session restarted for a flag change came back with an empty
+    # per-session record and re-announced the same 11 notes (autostereogram,
+    # 08:35 2026-09-03 — "Didn't we do this all already?").
+    stalled_by_app = state.setdefault("stalled_by_app", {})
 
     events, new = [], {}
     for s in sessions:
@@ -997,8 +1002,10 @@ def main():
                 mine = [txt for app, texts in open_notes.items() if app in keys
                         for txt in texts]
                 sig = "|".join(sorted(mine))[:4000] if mine else None
-                if mine and sig != p.get("stalled_sig"):
+                appkey = "|".join(sorted(keys)) if keys else (proj or name)
+                if mine and sig != p.get("stalled_sig") and sig != stalled_by_app.get(appkey):
                     stall_sig = sig
+                    stalled_by_app[appkey] = sig
                     body = [(False, t[:150]) for t in mine[:4]]
                     if len(mine) > 4:
                         body.append((False, f"… and {len(mine) - 4} more"))
