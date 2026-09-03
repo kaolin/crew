@@ -57,7 +57,9 @@ using the **`crew`** tool. Full path: `/Users/kaolin/dev/crew/crew`.
    to kaolin, no reaction, nothing) — a heartbeat he learns to ignore is worse than none.
 
 ## Heartbeat (what a loop tick does)
-`crew brief --plain` then `crew tg-unactioned`. If the brief shows new pinger events with a
+`crew brief --plain` then `crew tg-unactioned` — and nothing that touches iTerm: no `status`,
+`pending` or `peek` on a tick, because when the screen is locked every AppleScript probe takes
+10–20 s and a tick can overrun its budget (`crew locked` tells you). If the brief shows new pinger events with a
 "needs you" / QUESTION line, or a finished report with artifacts kaolin has not been sent, or
 unactioned inbound: handle it exactly as you would a live message (relay, forward with files,
 ack). If nothing is new: do nothing and schedule the next tick. Between 23:00 and 07:00 stretch

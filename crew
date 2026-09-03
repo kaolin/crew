@@ -177,6 +177,8 @@ def cmd_status(a):
         print()
     if not a.source:
         _report_unregistered(sessions)
+        if _screen_locked():
+            print(c("2", "  (screen locked — no screen probes, so 'at prompt' and 'pending' read from transcripts only)\n"))
 
 
 def _unregistered(sessions):
@@ -1027,9 +1029,32 @@ def _classify_screen(rows):
             "detail": question or "(see the screen)", "options": opts}
 
 
+_LOCKED = None
+
+
+def _screen_locked():
+    """Is the login screen up? Read from IOKit — 30 ms, no AppleScript.
+
+    Matters because every screen probe goes through iTerm2 via osascript, and with
+    the screen locked each of those takes 10–20 s instead of milliseconds. A
+    `crew status` with three busy sessions blew through a two-minute budget on
+    2026-09-03 03:13 that way. Memoised per process: one answer per run."""
+    global _LOCKED
+    if _LOCKED is None:
+        try:
+            out = subprocess.run(["ioreg", "-n", "Root", "-d1", "-a"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            _LOCKED = "CGSSessionScreenIsLocked" in out
+        except Exception:
+            _LOCKED = False
+    return _LOCKED
+
+
 def _screen_tail(s, lines=18):
     """Last N lines of the session's live terminal, or [] if not scrapeable.
     The transcript is structured but lags; the screen is what's actually asking."""
+    if _screen_locked():
+        return []   # would hang for ~15 s per session; the caller falls back to the transcript
     try:
         tty = _tty_of(s.get("pid"))
         if not tty:
@@ -1652,6 +1677,15 @@ def cmd_label(a):
     print()
 
 
+def cmd_locked(a):
+    """Exit 0 and say 'locked' if the login screen is up, else exit 1 'unlocked'.
+    A locked Mac stalls new sessions at startup and makes every iTerm probe crawl;
+    the hub checks this before deciding anything about a window it cannot see."""
+    locked = _screen_locked()
+    print("locked" if locked else "unlocked")
+    sys.exit(0 if locked else 1)
+
+
 def cmd_hub(a):
     """The hub is not `claude --resume`: it needs its settings file (Telegram enabled
     for this one session only), the channel, and the protocol as a system prompt. A
@@ -2147,6 +2181,8 @@ def main():
                     help="rebuild the recorded layout verbatim; skip sending drifted windows home")
     pr.add_argument("--spaces-source", dest="spaces_source", help="spaces JSON (testing; default: live `spacetag dump`)")
     pr.set_defaults(fn=cmd_restore)
+    plk = sub.add_parser("locked", help="is the login screen up? (exit 0 locked / 1 unlocked)")
+    plk.set_defaults(fn=cmd_locked)
     ph = sub.add_parser("hub", help="how to restart the hub session without losing its Telegram channel")
     ph.set_defaults(fn=cmd_hub)
     ptg = sub.add_parser("tg-prune", help="delete Telegram inbox attachments older than N days (dry-run by default)")
