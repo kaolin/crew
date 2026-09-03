@@ -11,7 +11,9 @@
     "",
     "Note the framing kaolin corrected on 2026-08-13: an update in flight is a",
     "submission-in-progress, not a finished app. render.py derives that from",
-    "TestFlight-vs-live versions, so it stays true without editing this file."
+    "TestFlight-vs-live versions, so it stays true without editing this file.",
+    "",
+    "`alias` is the name kaolin calls it (repo/working name) when that differs from the store name. Rendered beside the title."
   ],
   "_STAGES": {
     "1": "In review — Apple has it",
@@ -23,27 +25,27 @@
   },
   "apps": {
     "Cosmic Specks": {
-      "stage": 1,
-      "do": "Decide whether to keep waiting.",
-      "why": "6.4 days is ~3x your other two, it was expedited, and the eclipse window it was timed for has passed — so the reason for the rush is gone either way. Leave it, or withdraw and resubmit with a listing that doesn't lean on the eclipse."
+      "stage": 2,
+      "alias": "Orrery",
+      "do": "Say when the sun work is done and it should go back in - it is out of review by your choice, not Apple's.",
+      "why": "PULLED from review 21 Aug 21:07 at your request, to iterate on the sun before shipping. Submission 4fb7439a is COMPLETE/canceled and 1.0 reads DEVELOPER_REJECTED - withdrawn, never seen by a reviewer, build 13 still attached and the version editable. It had been WAITING_FOR_REVIEW since 20 Aug 04:28 after the 17 Aug 4.3(a) Design-Spam rejection of build 11. Availability is set (175 countries)."
     },
     "Sandpainting: Zen Sand Art": {
-      "stage": 1,
-      "why": "Its session signed off with 'nothing left on your side' — submission complete, including the IAP item that had to be finished in the browser."
+      "stage": 6,
+      "why": "Live 21 Aug. 1.0 (35) approved overnight after ~10 days in review - submitted 11 Aug, the second 10-day review after Cosmic Specks against a 1.6-day median. It sat approved-but-unbuyable until kaolin noticed country availability had never been set; once set, every territory went PROCESSING_TO_AVAILABLE and it appeared. Price schedule was already in place (base USA, USD, manual)."
     },
     "Magic Messages": {
       "stage": 1,
-      "why": "Build 18 in review. Build 19 is on Grayhame as a dev build, which doesn't affect the review — that phone is off the TestFlight track until you ask for it back."
+      "why": "Build 18 in review. Build 19 is on Grayhame as a dev build, which doesn't affect the review — that phone is off the TestFlight track until you ask for it back.",
+      "alias": "autostereogram"
     },
     "Spot The Hustle": {
-      "stage": 2,
-      "do": "Play Console → Add credential → pick 'Play app signing key' → Save.",
-      "why": "One click unblocks build 37 to the Moto and the first real leaderboard test. Confirmed from the API: the package has only alpha and internal tracks, so Google production access has NOT come through. Also pending: your 18 closed testers aren't on the OAuth test-user list, so leaderboards silently no-op for them."
+      "stage": 6,
+      "why": "Nothing of his outstanding as of 19 Aug: Play Games Services published 15 Aug, Brazil tax info submitted 17 Aug, Android build 39 promoted to full production tonight (was 37 - silently dropped leaderboard scores, red flash over game-over, Back gesture killed runs). iOS 2.2.0 is live and on sale in 175 territories; TestFlight 2.2.0 (37) is 11 days old and NOT in review - ASC shows no queue and no draft. Open thread is passive: whether real players' leaderboard scores land now that consent is out of Testing, unproven for any account but his."
     },
     "FractRoam": {
-      "stage": 2,
-      "do": "Answered — going to the beta track so you can check it on your phone.",
-      "why": "R8 + SDK bump: 68% smaller download (AAB 483 KB), clears three of four Play advisories, verified on device including the shrink-fragile Share FileProvider path. Live is still versionCode 3."
+      "stage": 6,
+      "why": "2.0.2 (versionCode 4) live on Play production as of 14 Aug, 100% rollout, and 2.1 live on the App Store. R8 + SDK bump: 68% smaller download."
     },
     "thereby": {
       "stage": 4,
@@ -51,14 +53,15 @@
       "why": "The code is genuinely last-mile: build 78 on Grayhame, 134 core tests, 9/9 flows. But there's no App Store Connect record yet, so all the store-side work is still ahead. Watch work (ask-every-time trip start) is in flight now."
     },
     "BabyPaints": {
-      "stage": 3,
-      "do": "Finish the screenshots for 2.1.0.",
-      "why": "The session has moved past painting polish into measurement — the two-thirds power law now checks out against your actual recorded input (v ∝ r^0.35 vs theory's 0.33, n=218) rather than being inferred from pixels. 1,192 tests green. It's also Godot with an Android preset already, so Play is closer than you'd think."
+      "stage": 2,
+      "do": "Plug the Moto in over USB with USB debugging on - a signed 2.1.0 (101) installer is armed and lands by itself.",
+      "why": "Screenshots for 2.1.0 are done and uploaded to the Play listing via the API (icon, feature graphic, 7 phone, 2 ten-inch). Play submitted for review 19 Aug - closed alpha, 2.1.0 (101), 172 countries, 13 changes in review. iOS has 2.1.0 (101) on TestFlight."
     },
     "Hide and See": {
       "stage": 4,
       "do": "Confirm free-with-no-IAP is final, then it needs an ASC record + screenshots.",
-      "why": "Dropping the $2.99 unlock takes the paywall off the critical path. Build 22 on Grayhame; the session is deep in fusion-teaching experiments (Pair/Tint/Fine), which is product work rather than store work."
+      "why": "Dropping the $2.99 unlock takes the paywall off the critical path. Build 22 on Grayhame; the session is deep in fusion-teaching experiments (Pair/Tint/Fine), which is product work rather than store work.",
+      "alias": "fusiontrainer"
     },
     "Spinnit": {
       "stage": 4,
@@ -66,39 +69,40 @@
       "why": "Everything verified so far is replay. Two things to feel for: whether 1.2 s to land is right (a guess, unlike train's 3 s which came from data), and whether the planet name flickers when you sit between two — worst around Mars↔Earth."
     },
     "sevensez": {
-      "stage": 4,
-      "do": "Decide if it's a product or a personal tool.",
-      "why": "On Grayhame with a real icon and signing set up. Before investing in store work: 7-of-9 frame agreement, 33.9% exact, 7.1% wrong on held-out real meters — it refuses a lot on purpose."
+      "stage": 6,
+      "alias": "sevensegment",
+      "why": "Parked 15 Aug — no active work and no session, deliberately. On Grayhame with a real icon and signing set up; whether it's a product or a personal tool is still unanswered. Model quality when parked: 7-of-9 frame agreement, 33.9% exact, 7.1% wrong on held-out real meters — it refuses a lot on purpose."
     },
     "Naming Rattle": {
       "stage": 5,
-      "do": "Resolve the art and font situation. Nothing else can move.",
-      "why": "A ghosting artist, legacy Joyce Croft interior art, and possibly unlicensed lettering. Until that's settled there is nothing legally shippable to upload. Its TestFlight build is 53 days old."
+      "waitingOn": "the artist — art and font licensing",
+      "why": "A ghosting artist, legacy Joyce Croft interior art, and possibly unlicensed lettering. Nothing is legally shippable until that's settled, and settling it isn't in your hands. TestFlight build is 53 days old."
     },
     "Curiouser: Presence & Wonder": {
       "stage": 3,
       "do": "Pick one: mint promo codes, or add a cross-promo line to Timeful/FractRoam release notes.",
-      "why": "1.4 is in TestFlight ahead of 1.3 live. The growth lever you already own is ~820 update-events across Timeful and FractRoam in two weeks — one release-note line reaches more relevant people than any single Reddit post."
+      "why": "1.4 is in TestFlight ahead of 1.3 live. The growth lever you already own is ~820 update-events across Timeful and FractRoam in two weeks — one release-note line reaches more relevant people than any single Reddit post.",
+      "alias": "mindfulpresence"
     },
     "Saintify": {
-      "stage": 3,
-      "why": "2.0.0 in TestFlight ahead of 1.1.0 live, with 2 testers actually installed (Craig and Anna). Fiel is the only genuinely unaccepted invite."
+      "stage": 6,
+      "why": "2.0.0 went live on the App Store 19 Aug, replacing 1.1.0. erif.org still says \"waiting for review\" - copy needs a pass."
     },
     "Disasteroids": {
-      "stage": 3,
-      "why": "1.2.0/143 in TestFlight ahead of 1.1.0 live. Godot with an iOS-only preset — Android is genuinely greenfield, verified across all branches, not half-finished."
+      "stage": 6,
+      "why": "1.2.0/149 went live on the App Store 19 Aug with the rewritten store copy and the corrected privacy label. Android is at the same code as a Play alpha draft."
     },
     "Timeful": {
       "stage": 6,
-      "why": "1.3.2 live; build 77 now on Grayhame."
+      "why": "1.3.2 live. Parked 15 Aug — no active work and no session, deliberately."
     },
     "izzit": {
       "stage": 6,
-      "why": "1.1.1 live on both stores; Play production 1.1.210."
+      "why": "1.1.1 live on both stores, Play production 1.1.210. Parked 15 Aug — no active work and no session, deliberately."
     },
     "A2V": {
       "stage": 6,
-      "why": "2.1 live, TestFlight 2.1/187."
+      "why": "2.1 live, TestFlight 2.1/187. Parked 15 Aug — no active work and no session, deliberately."
     }
   }
 }

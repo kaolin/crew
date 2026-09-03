@@ -20,8 +20,13 @@ OUT_JSON = os.path.join(HERE, "status.json")
 PLAY_KEY = os.path.expanduser("~/keys/play-claude-appdev-820105877775.json")
 PLAY_BASE = "https://androidpublisher.googleapis.com/androidpublisher/v3/applications"
 
-QUEUE_STATES = {"WAITING_FOR_REVIEW", "IN_REVIEW", "PENDING_APPLE_RELEASE",
-                "PENDING_DEVELOPER_RELEASE", "PROCESSING_FOR_APP_STORE"}
+# READY_FOR_REVIEW is a queue state, not a draft one: it's what a version reads
+# the moment it is submitted, before Apple moves it to WAITING_FOR_REVIEW. Left
+# out of this set it landed in `draft`, where triage() reads no state at all, and
+# Cosmic Specks rendered as idle minutes after being resubmitted (19 Aug).
+QUEUE_STATES = {"READY_FOR_REVIEW", "WAITING_FOR_REVIEW", "IN_REVIEW",
+                "PENDING_APPLE_RELEASE", "PENDING_DEVELOPER_RELEASE",
+                "PROCESSING_FOR_APP_STORE"}
 SETTLED = {"REPLACED_WITH_NEW_VERSION", "READY_FOR_SALE"}
 
 
