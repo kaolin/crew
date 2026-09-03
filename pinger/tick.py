@@ -294,21 +294,29 @@ def split_report(head, lines, escape=False, limit=TG_LIMIT - 60):
     decision). Continuation messages are marked '… n/N'; that marker and the
     ellipsis are MarkdownV2-safe, so it survives both render paths."""
     esc = md_escape if escape else (lambda t: t)
-    rendered = [("• " + esc(t)) if b else esc(t) for b, t in lines]
+    rendered = [(b, ("• " + esc(t)) if b else esc(t)) for b, t in lines]
 
     msgs, cur = [], head
-    for ln in rendered:
+    prev_b = None
+    for b, ln in rendered:
+        # Blank line between paragraphs, single newline between consecutive
+        # bullets so a list still reads as a list. Everything was single-spaced
+        # before, which on a phone runs the head straight into the body
+        # (kaolin, 2026-09-03: "needs paragraph breaks?").
+        sep = "\n" if (prev_b and b) else "\n\n"
         while len(ln) > limit:                       # single monster line
             cut = ln.rfind(" ", 0, limit)
             if cut <= 0:
                 cut = limit
             part, ln = ln[:cut], "…" + ln[cut:].lstrip()
-            if cur and len(cur) + 1 + len(part) > limit:
+            if cur and len(cur) + len(sep) + len(part) > limit:
                 msgs.append(cur); cur = ""
-            cur += ("\n" if cur else "") + part
-        if cur and len(cur) + 1 + len(ln) > limit:
+            cur += (sep if cur else "") + part
+            sep = "\n"                               # the rest is one wrapped line
+        if cur and len(cur) + len(sep) + len(ln) > limit:
             msgs.append(cur); cur = ""
-        cur += ("\n" if cur else "") + ln
+        cur += (sep if cur else "") + ln
+        prev_b = b
     if cur.strip():
         msgs.append(cur)
     if not msgs:

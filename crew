@@ -765,8 +765,13 @@ def _space_for_session(s, spaces):
     projn, namen, cwdn = _norm(proj(cwd)), _norm(s.get("name")), _norm(cwd)
     want = _aliases().get(proj(cwd)) or _aliases().get(s.get("name") or "")
     if want is not None:
+        wantn = _norm(str(want))
         for sp in spaces:
-            if str(sp.get("index")) == str(want) or sp.get("uuid") == want or _norm(sp.get("tag")) == _norm(str(want)):
+            # Substring, not equality: a Space gets renamed ("hidden game" →
+            # "magic messages / hidden game") and an exact-match alias silently
+            # stops resolving, which looks like the session lost its home.
+            if (str(sp.get("index")) == str(want) or sp.get("uuid") == want
+                    or (wantn and wantn in _norm(sp.get("tag")))):
                 return sp
     for sp in spaces:
         tagn = _norm(sp.get("tag"))
