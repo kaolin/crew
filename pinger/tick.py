@@ -73,6 +73,14 @@ TG_LIMIT          = 3900       # Telegram hard-caps sendMessage at 4096; leave h
 # ----------------------------------------------------------------------------
 
 
+def display_name(name):
+    """Session name as it should read on a phone. `crew restore` launches sessions
+    as `--name "[claude] <project>"` so iTerm windows are labelled; that prefix is
+    for the desktop, not for a Telegram alert. Also used before the EXCLUDE check
+    so a relabelled hub stays excluded."""
+    return (name or "").replace("[claude] ", "", 1)
+
+
 def log(msg):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -795,7 +803,7 @@ def main():
         # Dry run: show the message each currently-idle session WOULD produce.
         # Sends nothing, writes no state.
         for s in get_sessions() or []:
-            if s["status"] != "idle" or s["name"] in EXCLUDE_NAMES:
+            if s["status"] != "idle" or display_name(s["name"]) in EXCLUDE_NAMES:
                 continue
             tpath = transcript_path(s.get("cwd"), s["sessionId"])
             proj  = os.path.basename(s.get("cwd", "")) or "?"
@@ -950,7 +958,7 @@ def main():
             # you learn to ignore, which is the failure this rule exists to fix.
             idle_since = (p.get("idle_since") or now) if p.get("status") == "idle" else now
             stall_done = bool(p.get("notified_stalled"))
-            if (NOTIFY_STALLED and not first_run and name not in EXCLUDE_NAMES
+            if (NOTIFY_STALLED and not first_run and display_name(name) not in EXCLUDE_NAMES
                     and not stall_done
                     and (now - idle_since) >= STALLED_MINS * 60):
                 keys = notes_app_for(name, s.get("cwd"))
@@ -1002,8 +1010,9 @@ def main():
             for kind, name, proj, extra, lines, ps in events:
                 hl = headlines.get(name) or ""
                 tail = f" · {hl}" if hl else ""
-                head_plain = f"{kind} {name} ({proj}) · {stamp} · {extra}{tail}"
-                head_md = (f"{kind} *{md_escape(name)}* \\({md_escape(proj)}\\) · "
+                shown = display_name(name)
+                head_plain = f"{kind} {shown} ({proj}) · {stamp} · {extra}{tail}"
+                head_md = (f"{kind} *{md_escape(shown)}* \\({md_escape(proj)}\\) · "
                            f"{md_escape(stamp)} · {md_escape(extra)}"
                            + (f" · {md_escape(hl)}" if hl else ""))
                 send_chunked(token, c,

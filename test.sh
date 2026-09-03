@@ -23,7 +23,8 @@ grep -q "sessionId" "$snap" || fail "snapshot missing sessionId"
 
 echo "== restore is dry-run by default and emits resume commands =="
 r=$(./crew restore --source "$snap")
-grep -q "claude --resume ff10d5a8" <<<"$r" || fail "restore missing resume command"
+grep -qE "claude.* --resume ff10d5a8" <<<"$r" || fail "restore missing resume command"
+grep -q "'--name' '\[claude\] " <<<"$r" || fail "restore didn't pass a [claude] --name label"
 grep -q "dry-run"                  <<<"$r" || fail "restore not dry-run by default"
 grep -q "would put"                <<<"$r" || fail "restore executed instead of dry-run"
 
@@ -183,6 +184,57 @@ m._pending=lambda s,**k: {'kind':'question','tool':'AskUserQuestion','detail':'q
 assert m._blocked_refusal({'name':'n','status':'waiting'},'send') is True
 print('  blocked-session detection + tell guard OK')
 " || fail "blocked-session handling wrong"
+
+echo "== snapshot records the intended home beside the actual Space, and reports the homeless =="
+dm=$(mktemp)
+dout=$(./crew snapshot --source fixture.json --spaces-source spaces_fixture.json --out "$dm")
+python3 -c "import json; m={s['name']:s for s in json.load(open('$dm'))}; assert m['izzit-2b']['homeSpaceIndex']==4, m['izzit-2b']; assert m['kaolin-e8']['homeSpace'] is None, m['kaolin-e8']; print('  izzit-2b home=4, kaolin-e8 homeless')" || fail "snapshot didn't record homeSpace"
+grep -q "no Space tag" <<<"$dout" || fail "snapshot didn't report the homeless session"
+grep -q "kaolin-e8"    <<<"$dout" || fail "homeless report didn't name kaolin-e8"
+
+echo "== restore re-resolves home from live Spaces and says where the window was =="
+python3 -c "
+import json
+m=json.load(open('$dm')); sp={s['index']:s for s in json.load(open('spaces_fixture.json'))}
+for s in m:
+    if s['name']=='izzit-2b':
+        s['space'], s['spaceIndex'], s['spaceTag'] = sp[2]['uuid'], 2, sp[2].get('tag')   # scattered onto fractroam
+json.dump(m, open('$dm','w'))"
+rr=$(./crew restore --source "$dm" --spaces-source spaces_fixture.json)
+grep -q "izzit-2b .*→ Space 4 · izzit"       <<<"$rr" || fail "restore didn't send izzit home"
+grep -q "was on Space 2 · fractroam"         <<<"$rr" || fail "restore didn't say where izzit had been"
+ra=$(./crew restore --source "$dm" --spaces-source spaces_fixture.json --as-found)
+grep -q "izzit-2b .*→ Space 2 · fractroam"   <<<"$ra" || fail "--as-found didn't keep the recorded Space"
+grep -q "was on"                              <<<"$ra" && fail "--as-found still claimed to move a window"
+rm -f "$dm"
+
+echo "== snapshot (non-tty) reports Space drift only when the picture changes =="
+qm=$(mktemp); rm -f "$qm"
+q1=$(./crew snapshot --source fixture.json --spaces-source spaces_fixture.json --out "$qm" | cat)
+q2=$(./crew snapshot --source fixture.json --spaces-source spaces_fixture.json --out "$qm" | cat)
+q3=$(./crew snapshot --source fixture.json --spaces-source spaces_fixture.json --out "$qm" --verbose | cat)
+grep -q "⚠" <<<"$q1" || fail "first snapshot (no previous map) should report"
+grep -q "⚠" <<<"$q2" && fail "unchanged snapshot should stay quiet when not a tty (launchd log noise)"
+grep -q "⚠" <<<"$q3" || fail "--verbose should always report"
+rm -f "$qm"
+
+echo "== labels: dedup, launcher lookup, drift sets =="
+python3 -c "
+from importlib.machinery import SourceFileLoader
+from importlib.util import spec_from_loader, module_from_spec
+l=SourceFileLoader('crewmod','./crew'); m=module_from_spec(spec_from_loader('crewmod',l)); l.exec_module(m)
+one=[{'cwd':'/Users/kaolin'}]
+two=[{'cwd':'/Users/kaolin'},{'cwd':'/Users/kaolin'}]
+assert m.label_name('/Users/kaolin','hub',one)=='[claude] kaolin', 'unique project keeps project name'
+assert m.label_name('/Users/kaolin','hub',two)=='[claude] hub', 'shared project falls back to session name'
+assert m._launcher_for('nonesuch-zz') is None, 'unknown launcher must be None'
+assert m._launcher_for('[claude] nonesuch-zz') is None, 'prefix stripped before lookup'
+d,h=m._drift_sets([{'name':'a','space':'X','homeSpace':'Y'},{'name':'b','space':'X','homeSpace':'X'},{'name':'c','space':'X','homeSpace':None}])
+assert d==frozenset({'a'}) and h==frozenset({'c'}), (d,h)
+assert m._tab_escape((1,2,3),literal=True).startswith('\\\\033]6;1;bg;red;brightness;1\\\\a'), m._tab_escape((1,2,3),literal=True)
+assert m._as_str('a\\\\b\"c')=='a\\\\\\\\b\\\\\"c', m._as_str('a\\\\b\"c')
+print('  label/launcher/drift helpers OK')
+" || fail "label helpers wrong"
 
 echo "== pinger suites =="
 # These lived beside tick.py and had to be remembered individually, so a broken

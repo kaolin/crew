@@ -268,16 +268,15 @@ def cmd_snapshot(a):
             "homeSpaceIndex": home.get("index") if home else None,
             "homeSpaceTag": home.get("tag") if home else None,
         })
+    try:
+        prev = json.load(open(path)) if os.path.exists(path) else []
+    except Exception:
+        prev = []
     # Safety: never let an empty/shrunk read (e.g. the launchd tick firing during
     # shutdown, when sessions are already dying) clobber a good reboot map.
-    if not manifest and os.path.exists(path) and not a.force:
-        try:
-            prev = json.load(open(path))
-        except Exception:
-            prev = []
-        if prev:
-            print(f"skip: 0 live sessions — keeping last good map ({len(prev)}) at {path}")
-            return
+    if not manifest and prev and not a.force:
+        print(f"skip: 0 live sessions — keeping last good map ({len(prev)}) at {path}")
+        return
     with open(path, "w") as f:
         json.dump(manifest, f, indent=2)
     if manifest and not a.out:  # keep a timestamped history of good maps
@@ -286,7 +285,20 @@ def cmd_snapshot(a):
         with open(os.path.join(hist, f"{int(time.time())}.json"), "w") as f:
             json.dump(manifest, f, indent=2)
     print(f"snapshotted {len(manifest)} sessions → {path}")
-    _report_space_drift(manifest)
+    # Interactive runs always get the drift report. The launchd agent fires every
+    # five minutes and is not a tty, so it only speaks when the picture CHANGES —
+    # otherwise the same 15-line warning lands in snapshot.log 288 times a day.
+    if sys.stdout.isatty() or a.verbose or _drift_sets(manifest) != _drift_sets(prev):
+        _report_space_drift(manifest)
+
+
+def _drift_sets(manifest):
+    """(drifted names, homeless names) — what the drift report is about, as sets
+    so two snapshots compare cheaply."""
+    drift = frozenset(m.get("name") for m in (manifest or [])
+                      if m.get("homeSpace") and m.get("space") and m["space"] != m["homeSpace"])
+    homeless = frozenset(m.get("name") for m in (manifest or []) if not m.get("homeSpace"))
+    return drift, homeless
 
 
 def _wherestr(index, tag):
@@ -331,7 +343,7 @@ def cmd_restore(a):
     # recorded position — a manifest taken while windows were scattered would otherwise
     # rebuild the scatter every reboot. Live lookup also repairs old manifests, which
     # have no homeSpace field, and picks up alias-file edits made since the snapshot.
-    spaces = [] if getattr(a, "as_found", False) else _spaces()
+    spaces = [] if getattr(a, "as_found", False) else _spaces(getattr(a, "spaces_source", None))
     homeless = []
     launched = 0
     for s in manifest:
@@ -1589,6 +1601,65 @@ def cmd_label(a):
     print()
 
 
+def cmd_hub(a):
+    """The hub is not `claude --resume`: it needs its settings file (Telegram enabled
+    for this one session only), the channel, and the protocol as a system prompt. A
+    bare relaunch comes back mute. Print the line that brings all of it back."""
+    launcher = os.path.join(SNAP_DIR, "launchers", "hub.sh")
+    sessions = load(None, include_all=False)
+    hub = next((s for s in sessions if (s.get("name") or "").replace("[claude] ", "") == "hub"), None)
+    print()
+    if not os.path.exists(launcher):
+        print(c("31", f"  no launcher at {launcher} — the hub cannot be restored with its channel."))
+        print()
+        return
+    if hub:
+        print(f"  hub is running: {hub.get('name')}  {c('2', hub.get('sessionId') or '')}")
+        print(f"  to restart it WITH its Telegram channel and protocol (from any terminal):\n")
+        print(f"      {launcher} --resume {hub.get('sessionId')}\n")
+        print(c("2", "  (`--continue` also works from ~; a bare `claude --resume` loses the channel.)"))
+    else:
+        print(c("33", "  no hub session is running."))
+        print(f"  start one:   {launcher}")
+        print(f"  or resume:   {launcher} --resume <sessionId>   (crew restore does this automatically)")
+    print()
+
+
+def cmd_tg_prune(a):
+    """The Telegram inbox keeps every attachment forever (25 MB / 339 files by
+    2026-09-03). Anything older than --days has long since been relayed; the
+    durable record is inbound.jsonl, not the file."""
+    inbox = os.path.join(TG_DIR, "inbox")
+    cutoff = time.time() - a.days * 86400
+    old = []
+    try:
+        for fn in os.listdir(inbox):
+            p = os.path.join(inbox, fn)
+            if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                old.append((p, os.path.getsize(p)))
+    except FileNotFoundError:
+        print(f"no inbox at {inbox}")
+        return
+    total = sum(sz for _, sz in old)
+    if not old:
+        print(f"nothing older than {a.days}d in {inbox}")
+        return
+    print(f"\n  {len(old)} file(s) older than {a.days}d, {total / 1e6:.1f} MB")
+    for p, sz in sorted(old)[:8]:
+        print(f"      {os.path.basename(p)}  {sz // 1024} KB")
+    if len(old) > 8:
+        print(f"      … and {len(old) - 8} more")
+    if not a.go:
+        print(c("2", "\n  dry-run. re-run with --go to delete.\n"))
+        return
+    for p, _ in old:
+        try:
+            os.remove(p)
+        except OSError as e:
+            print(f"  could not remove {p}: {e}")
+    print(f"\n  deleted {len(old)} file(s), freed {total / 1e6:.1f} MB\n")
+
+
 def cmd_doctor(a):
     def check(label, ok, detail=""):
         mark = c("32", "✓") if ok else c("31", "✗")
@@ -1941,13 +2012,22 @@ def main():
     pn.add_argument("--out", help=f"manifest path (default {SNAP_DIR}/latest.json)")
     pn.add_argument("--force", action="store_true", help="write even an empty read (default: keep last good map)")
     pn.add_argument("--spaces-source", dest="spaces_source", help="spaces JSON (testing; default: live `spacetag dump`)")
+    pn.add_argument("--verbose", action="store_true",
+                    help="always print the Space drift report (non-tty runs only print it when it changes)")
     pn.set_defaults(fn=cmd_snapshot)
     pr = sub.add_parser("restore", help="resume every session from a manifest into fresh iTerm2 windows")
     pr.add_argument("--source", help=f"manifest path (default {SNAP_DIR}/latest.json)")
     pr.add_argument("--go", action="store_true", help="actually open windows (default: dry-run)")
     pr.add_argument("--as-found", dest="as_found", action="store_true",
                     help="rebuild the recorded layout verbatim; skip sending drifted windows home")
+    pr.add_argument("--spaces-source", dest="spaces_source", help="spaces JSON (testing; default: live `spacetag dump`)")
     pr.set_defaults(fn=cmd_restore)
+    ph = sub.add_parser("hub", help="how to restart the hub session without losing its Telegram channel")
+    ph.set_defaults(fn=cmd_hub)
+    ptg = sub.add_parser("tg-prune", help="delete Telegram inbox attachments older than N days (dry-run by default)")
+    ptg.add_argument("--days", type=int, default=30, help="keep files newer than this many days (default 30)")
+    ptg.add_argument("--go", action="store_true", help="actually delete (default: list what would go)")
+    ptg.set_defaults(fn=cmd_tg_prune)
     pk = sub.add_parser("peek", help="show a session's recent conversation (read-only, any terminal)")
     pk.add_argument("name")
     pk.add_argument("--turns", type=int, default=4, help="recent turns to show (transcript mode)")

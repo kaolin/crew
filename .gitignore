@@ -6,3 +6,6 @@ __pycache__/
 # pinger runtime artifacts — hold live session names and local paths
 pinger/state.json
 pinger/*.log
+
+# sampled every 5 min by com.kaolin.claude-usage-sampler — local data, not source
+usage/readings.tsv
