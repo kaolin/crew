@@ -1002,7 +1002,10 @@ def main():
                 mine = [txt for app, texts in open_notes.items() if app in keys
                         for txt in texts]
                 sig = "|".join(sorted(mine))[:4000] if mine else None
-                appkey = "|".join(sorted(keys)) if keys else (proj or name)
+                # Key on the project directory, not the session name: the name
+                # changes on every relaunch ("orrery-28" → "[claude] orrery") and
+                # a name-derived key made the memory miss after the 12:05 restart.
+                appkey = os.path.basename((s.get("cwd") or "").rstrip("/")).lower() or (proj or name)
                 if mine and sig != p.get("stalled_sig") and sig != stalled_by_app.get(appkey):
                     stall_sig = sig
                     stalled_by_app[appkey] = sig
@@ -1029,6 +1032,7 @@ def main():
                         "last_report": now}
 
     save_state({"initialized": True, "updated": now, "sessions": new,
+                "stalled_by_app": stalled_by_app,
                 "tunnel_alerted": tunnel_alerted,
                 "poller_alerted": poller_alerted,
                 "poller_dead_since": poller_dead_since})
