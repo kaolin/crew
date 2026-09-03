@@ -326,10 +326,12 @@ def cmd_restore(a):
                 break
         else:
             args += ["--name", label]
-        flagstr = "".join(" " + shq(f) for f in args)
+        launcher = _launcher_for(name)
+        flagstr = "" if launcher else "".join(" " + shq(f) for f in args)
+        cmd = shq(launcher) if launcher else "claude" + flagstr
         tint = (_tab_escape(_tab_color_for(proj(cwd)), literal=True) + _BADGE_CLEAR_LITERAL
-                + _title_escape(label_name(cwd), literal=True))
-        resume = f"printf {shq(tint)} && cd {shq(cwd)} && claude{flagstr} --resume {sid}"
+                + _title_escape(label, literal=True))
+        resume = f"printf {shq(tint)} && cd {shq(cwd)} && {cmd} --resume {sid}"
         if a.go:
             if space:
                 subprocess.run([_spacetag_bin(), "goto", str(space)])  # land the new window on its Space
@@ -1494,6 +1496,20 @@ def _write_tty(tty, s):
         return True
     except Exception:
         return False
+
+
+def _launcher_for(name):
+    """~/.crew/launchers/<session>.sh, if one exists.
+
+    For a session whose launch is more than flags — the hub carries the Telegram
+    channel, its own settings file and the whole hub protocol as an appended system
+    prompt — replaying what `ps` reported is brittle. A launcher script owns the
+    invocation instead, and crew just appends --resume."""
+    base = (name or "").replace("[claude] ", "").strip()
+    if not base:
+        return None
+    p = os.path.join(SNAP_DIR, "launchers", base + ".sh")
+    return p if os.path.exists(p) and os.access(p, os.X_OK) else None
 
 
 def label_name(cwd, name=None, sessions=None):
