@@ -427,6 +427,12 @@ def at_prompt_via_crew(name, timeout=10):
                              capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return False
+    if out.returncode == 3:
+        # Screen locked: crew cannot read the terminal, so it did not look. None
+        # keeps the busy clock running without alerting — a session that is only
+        # "busy" because a background shell outlived its turn was reported as
+        # "busy 3.0h — may be hung" at 05:14 on 2026-09-03 for exactly this reason.
+        return None
     return out.returncode == 0
 
 

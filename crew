@@ -1321,6 +1321,7 @@ def cmd_at_prompt(a):
       0  typeable now
       1  exists, but mid-turn — keep waiting
       2  NO SUCH SESSION — stop waiting, it is never coming back
+      3  COULD NOT LOOK — screen locked, no verdict; do not treat as hung
 
     Anything polling `until at-prompt` must treat 2 as fatal. A watcher that
     lumps 2 in with 1 waits forever on a name that no longer exists: a session
@@ -1330,6 +1331,9 @@ def cmd_at_prompt(a):
     if not s:
         print(f"{a.name}: no such session", file=sys.stderr)
         sys.exit(2)
+    if _screen_locked():
+        print(f"{s.get('name')}: cannot look — screen locked", file=sys.stderr)
+        sys.exit(3)
     rows = _screen_tail(s, lines=12)
     ready = at_prompt(s, rows)
     shown = prompt_text(s, rows)
