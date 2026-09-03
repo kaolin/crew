@@ -6,6 +6,25 @@ Kept separate from hourly.py so the page can be rebuilt from a stored snapshot
 """
 import collections, html, json, os, time
 
+
+def ascii_safe(html_text):
+    """Replace non-ASCII punctuation with HTML entities.
+
+    The page ships without a <meta charset> (the artifact wrapper owns <head>),
+    so a host that guesses Latin-1 renders UTF-8 punctuation as mojibake —
+    kaolin saw "838Ã—" for "838×" and "â†'" for "→". Entities sidestep the
+    guess entirely. Anything still non-ASCII gets a numeric entity.
+    """
+    ent = {'—': '&mdash;', '–': '&ndash;', '→': '&rarr;', '←': '&larr;', '↔': '&harr;', '·': '&middot;', '×': '&times;', '÷': '&divide;', '’': '&rsquo;', '‘': '&lsquo;', '“': '&ldquo;', '”': '&rdquo;', '…': '&hellip;', '∝': '&prop;', '°': '&deg;', '≥': '&ge;', '≤': '&le;'}
+    out = []
+    for ch in html_text:
+        if ord(ch) < 128:
+            out.append(ch)
+        else:
+            out.append(ent.get(ch) or f"&#{ord(ch)};")
+    return "".join(out)
+
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "usage.json")
 OUT = os.path.join(HERE, "usage.html")
@@ -276,5 +295,5 @@ magnitude apart.</p>
 
 
 if __name__ == "__main__":
-    open(OUT, "w").write(build())
+    open(OUT, "w").write(ascii_safe(build()))
     print(f"wrote {OUT}")

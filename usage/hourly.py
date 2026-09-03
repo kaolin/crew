@@ -38,6 +38,9 @@ def collect(hours=HOURS):
     cutoff = time.time() - hours * 3600
     seen = set()
     hourly = collections.defaultdict(lambda: collections.Counter())
+    # Per-hour, per-project output. The stacked chart needs this; the flat
+    # by_project total can't say WHEN a project spent, only how much.
+    hourly_proj = collections.defaultdict(lambda: collections.Counter())
     by_project = collections.Counter()
     by_model = collections.Counter()
     turns = collections.Counter()
@@ -87,6 +90,7 @@ def collect(hours=HOURS):
                 row["turns"] += 1
                 out = usage.get("output_tokens") or 0
                 by_project[project] += out
+                hourly_proj[bucket][project] += out
                 by_model[msg.get("model") or "?"] += out
                 turns[project] += 1
 
@@ -95,6 +99,7 @@ def collect(hours=HOURS):
         "hours": hours,
         "source": "local Claude CLI transcripts on this machine",
         "hourly": {k: dict(v) for k, v in sorted(hourly.items())},
+        "hourly_by_project": {k: dict(v) for k, v in sorted(hourly_proj.items())},
         "by_project": dict(by_project.most_common()),
         "by_model": dict(by_model.most_common()),
         "turns_by_project": dict(turns.most_common()),
