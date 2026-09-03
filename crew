@@ -15,9 +15,13 @@ stdlib only — no pip/conda env needed.
 """
 import sys, os, io, json, time, datetime, subprocess, argparse, shutil, re, calendar
 
-HOME = os.path.expanduser("~")
+# CREW_HOME lets the test suite point every state path (Telegram log + cursors,
+# pinger queue, status files, ~/.crew) at a scratch tree instead of the live one.
+HOME = os.environ.get("CREW_HOME") or os.path.expanduser("~")
 SNAP_DIR = os.path.join(HOME, ".crew")
 PLIST_LABEL = "com.kaolin.crew-snapshot"
+PRUNE_LABEL = "com.kaolin.crew-tg-prune"
+STATUS_STALE_SECS = 24 * 3600   # a status file older than this is a snapshot, not a state
 
 # Telegram "actioned" tracking. Splits "the server DELIVERED it" (inbound.cursor,
 # owned by the telegram plugin) from "the hub actually RELAYED/handled it"
@@ -345,6 +349,15 @@ def cmd_restore(a):
     # have no homeSpace field, and picks up alias-file edits made since the snapshot.
     spaces = [] if getattr(a, "as_found", False) else _spaces(getattr(a, "spaces_source", None))
     homeless = []
+    # Folders that will stop at the trust dialog. Say so up front; after --go, answer it.
+    untrusted = [(s.get("sessionId"), s.get("cwd")) for s in manifest
+                 if s.get("cwd") and s.get("sessionId") and _trusted(s["cwd"]) is False]
+    if untrusted:
+        print(c("33", f"  ⚠ {len(untrusted)} folder(s) have not cleared the trust dialog — "
+                      f"{'restore will answer it' if a.go else 'they would stop at it'}:"))
+        for _, cwd in untrusted:
+            print(f"      {cwd}")
+        print()
     launched = 0
     for s in manifest:
         cwd, sid, name = s.get("cwd"), s.get("sessionId"), s.get("name") or ""
@@ -398,6 +411,13 @@ def cmd_restore(a):
         for name, p in homeless:
             print("      {:<20} {}".format(name or "?", p))
         print(c("2", f"      fix: tag a Space for it, or map it in {os.path.join(SNAP_DIR, 'space_aliases.json')}"))
+    if a.go and untrusted:
+        print(c("2", f"\n  waiting for {len(untrusted)} trust prompt(s)…"))
+        done, left = _answer_trust_prompts(untrusted)
+        for _, cwd in done:
+            print(f"  ✓ trusted {cwd}")
+        for _, cwd in left:
+            print(c("33", f"  ⚠ {cwd}: no trust prompt seen — look at the window"))
     if not a.go:
         print(f"\n# dry-run: {launched} sessions. re-run with --go to open + place + resume.")
 
@@ -1428,6 +1448,28 @@ def cmd_goto(a):
 
 # ---- setup / doctor: make crew self-installing (so it packages cleanly) ----
 
+def _prune_plist_xml(crew_path):
+    log = os.path.join(SNAP_DIR, "tg-prune.log")
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{PRUNE_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>{crew_path} tg-prune --days 30 --go</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Weekday</key><integer>0</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>10</integer></dict>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict>
+</plist>
+'''
+
+
 def _plist_xml(crew_path):
     log = os.path.join(SNAP_DIR, "snapshot.log")
     return f'''<?xml version="1.0" encoding="UTF-8"?>
@@ -1458,6 +1500,7 @@ def cmd_setup(a):
         print(f"would symlink {link} -> {self_path}")
         print(f"would write   {plist_path}  (from this exact path — portable)")
         print(f"would load    {PLIST_LABEL} (snapshot every 300s)")
+        print(f"would load    {PRUNE_LABEL} (tg-prune --days 30 --go, Sundays 04:10)")
         return
     os.makedirs(os.path.dirname(link), exist_ok=True)
     if os.path.lexists(link):
@@ -1471,6 +1514,14 @@ def cmd_setup(a):
     uid = os.getuid()
     subprocess.run(["launchctl", "bootout", f"gui/{uid}/{PLIST_LABEL}"], capture_output=True)
     subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", plist_path], capture_output=True)
+    # Weekly inbox prune. Attachments older than 30 days have long been relayed; the
+    # durable record is inbound.jsonl. Its own agent, not a side effect of snapshot.
+    prune_path = os.path.expanduser(f"~/Library/LaunchAgents/{PRUNE_LABEL}.plist")
+    with open(prune_path, "w") as f:
+        f.write(_prune_plist_xml(self_path))
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{PRUNE_LABEL}"], capture_output=True)
+    subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", prune_path], capture_output=True)
+    print(f"loaded        {PRUNE_LABEL} (tg-prune --days 30 --go, Sundays 04:10)")
     print(f"loaded  {PLIST_LABEL} (snapshot every 300s)\n")
     cmd_doctor(a)
 
@@ -1809,6 +1860,68 @@ def _age(iso):
     return "%.0fd ago" % (secs / 86400)
 
 
+def _age_secs(iso):
+    """Seconds since an ISO-ish timestamp ('2026-09-03T01:28:00-0700' or with ':' in
+    the offset, or a bare 'YYYY-MM-DD HH:MM'), else None."""
+    if not iso:
+        return None
+    s = str(iso).strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            t = time.strptime(s.replace("Z", "+0000") if fmt.endswith("%z") else s[:19], fmt)
+        except ValueError:
+            continue
+        if fmt.endswith("%z"):
+            try:
+                import datetime as _dt
+                d = _dt.datetime.strptime(s.replace("Z", "+0000"), fmt)
+                return time.time() - d.timestamp()
+            except Exception:
+                return None
+        return time.time() - time.mktime(t)
+    return None
+
+
+def _trusted(cwd):
+    """Has this folder cleared Claude's trust dialog? Read from ~/.claude.json. A
+    session launched in an untrusted folder stops at 'Yes, I trust this folder'
+    with 'No, exit' preselected and never registers."""
+    try:
+        d = json.load(open(os.path.join(HOME, ".claude.json")))
+        return bool((d.get("projects") or {}).get(cwd, {}).get("hasTrustDialogAccepted"))
+    except Exception:
+        return None   # unknown, not untrusted
+
+
+def _answer_trust_prompts(pending, timeout=45):
+    """After restore --go: for each (sid, cwd) launched into an untrusted folder,
+    wait for its claude process, look at its screen, and if it is sitting on the
+    trust prompt choose 'Yes, I trust this folder' (down, enter). Only that prompt —
+    anything else on screen is left alone and reported."""
+    done, left = [], list(pending)
+    deadline = time.time() + timeout
+    while left and time.time() < deadline:
+        time.sleep(3)
+        ps = subprocess.run(["ps", "-eo", "tty=,command="], capture_output=True, text=True).stdout
+        for sid, cwd in list(left):
+            tty = next((ln.split(None, 1)[0] for ln in ps.splitlines()
+                        if "--resume " + sid in ln and ln.split(None, 1)[0] != "??"), None)
+            if not tty:
+                continue
+            tty = tty if tty.startswith("/dev/") else "/dev/" + tty
+            try:
+                screen = subprocess.run(["osascript", "-e", _OSA_PEEK, tty],
+                                        capture_output=True, text=True, timeout=15).stdout
+            except Exception:
+                screen = ""
+            if "trust this folder" in screen:
+                subprocess.run(["osascript", "-e", _OSA_TYPE, tty, "\x1b[B"], capture_output=True, timeout=15)
+                time.sleep(0.4)
+                subprocess.run(["osascript", "-e", _OSA_SUBMIT, tty], capture_output=True, timeout=15)
+                done.append((sid, cwd)); left.remove((sid, cwd))
+    return done, left
+
+
 def _status_files():
     try:
         names = sorted(os.listdir(STATUS_DIR))
@@ -1927,6 +2040,18 @@ def cmd_brief(a):
             print(C("36", "UNPUSHED WORK"))
             for n, u in unpushed:
                 print("  %-16s %s" % (n, ", ".join(str(x) for x in u)[:100]))
+            print("")
+
+        # Everything above is only as true as the file is recent. A status file
+        # nobody has touched in a day describes a session that has since done a
+        # day's work — read it as history, and `crew peek` the session for now.
+        old = [(n, _age(d.get("updated_at"))) for n, d in files
+               if _age_secs(d.get("updated_at")) is not None
+               and _age_secs(d.get("updated_at")) > STATUS_STALE_SECS]
+        if old:
+            print(C("33;1", "STALE STATUS FILES — %d (older than a day; peek the session instead)" % len(old)))
+            for n, ag in old:
+                print("  %-16s %s" % (n, ag))
             print("")
 
     if not a.no_ack and mx > since:

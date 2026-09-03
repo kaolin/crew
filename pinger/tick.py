@@ -914,6 +914,7 @@ def main():
                     seen, since = nlines, now
                     last_sig, last_sent = sig, now
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
+                        "stalled_sig": p.get("stalled_sig"),
                         "busy_since": busy_since, "notified_stuck": notified,
                         "reported_lines": seen, "last_report": since,
                         "last_sig": locals().get("last_sig", p.get("last_sig")),
@@ -941,6 +942,7 @@ def main():
                 events.append((glyph, name, proj, what, body, []))
                 notified = True
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
+                        "stalled_sig": p.get("stalled_sig"),
                         "busy_since": p.get("busy_since"), "notified_stuck": False,
                         "notified_waiting": notified}
         else:  # idle
@@ -958,13 +960,20 @@ def main():
             # you learn to ignore, which is the failure this rule exists to fix.
             idle_since = (p.get("idle_since") or now) if p.get("status") == "idle" else now
             stall_done = bool(p.get("notified_stalled"))
+            # Cooldown on the SET of notes, not the idle stretch: the same twenty
+            # notes re-announced after every 30 idle minutes is the nag this rule
+            # was written to avoid (106 open, 224h, 2026-09-03). Fire again only
+            # when a note is added or closed.
+            stall_sig = p.get("stalled_sig")
             if (NOTIFY_STALLED and not first_run and display_name(name) not in EXCLUDE_NAMES
                     and not stall_done
                     and (now - idle_since) >= STALLED_MINS * 60):
                 keys = notes_app_for(name, s.get("cwd"))
                 mine = [txt for app, texts in open_notes.items() if app in keys
                         for txt in texts]
-                if mine:
+                sig = "|".join(sorted(mine))[:4000] if mine else None
+                if mine and sig != p.get("stalled_sig"):
+                    stall_sig = sig
                     body = [(False, t[:150]) for t in mine[:4]]
                     if len(mine) > 4:
                         body.append((False, f"… and {len(mine) - 4} more"))
@@ -974,10 +983,12 @@ def main():
                                    body, []))
                     stall_done = True
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
+                        "stalled_sig": p.get("stalled_sig"),
                         "busy_since": None, "notified_stuck": False,
                         "notified_waiting": False,
                         "idle_since": idle_since,
                         "notified_stalled": stall_done,
+                        "stalled_sig": stall_sig,
                         # keep the screen-based path in step, so a session that
                         # picks up a background task next turn doesn't re-report
                         # everything it already sent from the idle edge

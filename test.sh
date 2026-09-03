@@ -5,6 +5,12 @@ cd "$(dirname "$0")"
 
 fail() { echo "FAIL: $1"; exit 1; }
 
+# Every state path (~/.crew aliases + manifests, Telegram cursors, status files)
+# resolves under CREW_HOME, so the fixtures never read the live machine — the
+# homeless-session test broke the moment a real alias mapped "kaolin" to a Space.
+export CREW_HOME="$(mktemp -d)"
+trap 'rm -rf "$CREW_HOME"' EXIT
+
 echo "== status renders groups, statuses, waitingFor =="
 out=$(./crew status --source fixture.json)
 echo "$out"
@@ -236,6 +242,52 @@ assert m._as_str('a\\\\b\"c')=='a\\\\\\\\b\\\\\"c', m._as_str('a\\\\b\"c')
 print('  label/launcher/drift helpers OK')
 " || fail "label helpers wrong"
 
+echo "== telegram cursors + brief against a scratch CREW_HOME =="
+th=$(mktemp -d)
+mkdir -p "$th/.claude/channels/telegram" "$th/.claude/status" "$th/.crew"
+old_ts=$(python3 -c "import time;print(time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(time.time()-3*86400)))")
+new_ts=$(python3 -c "import time;print(time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime()))")
+cat > "$th/.claude/channels/telegram/inbound.jsonl" <<EOF
+{"seq": 1, "ts": "$new_ts", "params": {"content": "handled already", "meta": {"message_id": 1}}}
+{"seq": 2, "ts": "$old_ts", "params": {"content": "ancient, outside the review window", "meta": {"message_id": 2}}}
+{"seq": 3, "ts": "$new_ts", "params": {"content": "fresh and unhandled", "meta": {"message_id": 3, "image_path": "/x/y.jpg"}}}
+EOF
+echo 1 > "$th/.claude/channels/telegram/actioned.cursor"
+u=$(CREW_HOME="$th" ./crew tg-unactioned)
+grep -q "fresh and unhandled"   <<<"$u" || fail "tg-unactioned missed seq 3"
+grep -q "image: /x/y.jpg"       <<<"$u" || fail "tg-unactioned dropped the image path"
+grep -q "handled already"       <<<"$u" && fail "tg-unactioned showed an actioned message"
+grep -q "ancient"               <<<"$u" && fail "tg-unactioned showed a record outside the 48h window"
+ua=$(CREW_HOME="$th" ./crew tg-unactioned --all)
+grep -q "ancient"               <<<"$ua" || fail "--all should include old records"
+CREW_HOME="$th" ./crew tg-actioned latest | grep -q "actioned.cursor = 3" || fail "tg-actioned latest didn't reach max seq"
+[[ $(cat "$th/.claude/channels/telegram/actioned.cursor") == 3 ]] || fail "cursor file not written"
+CREW_HOME="$th" ./crew tg-unactioned | grep -q "caught up" || fail "after actioning, should be caught up"
+# brief: one unseen pinger event, one fresh status file, one stale (3 days) status file
+cat > "$th/.claude/status/_pinger.jsonl" <<EOF
+{"seq": 1, "ts": "$new_ts", "kind": "✅", "session": "izzit-55", "project": "izzit", "text": "finished after 4m"}
+EOF
+python3 - "$th" <<'PY'
+import json, sys, time, os
+th = sys.argv[1]
+now = time.strftime("%Y-%m-%dT%H:%M:%S-0700")
+old = time.strftime("%Y-%m-%dT%H:%M:%S-0700", time.localtime(time.time() - 3*86400))
+json.dump({"updated_at": now, "needs_decision": ["ship it?"]}, open(os.path.join(th, ".claude/status/izzit.json"), "w"))
+json.dump({"updated_at": old, "summary": "old news"}, open(os.path.join(th, ".claude/status/orrery.json"), "w"))
+PY
+b=$(CREW_HOME="$th" ./crew brief --plain --no-ack)
+grep -q "1 event(s) you have not seen" <<<"$b" || fail "brief didn't show the unseen pinger event"
+grep -q "NEEDS KAOLIN"                 <<<"$b" || fail "brief didn't surface needs_decision"
+grep -q "STALE STATUS FILES"           <<<"$b" || fail "brief didn't flag the 3-day-old status file"
+grep -q "orrery"                       <<<"$b" || fail "stale block should name orrery"
+[[ -e "$th/.claude/status/_brief.cursor" ]] && fail "--no-ack must not write the brief cursor"
+CREW_HOME="$th" ./crew brief --plain >/dev/null
+[[ $(cat "$th/.claude/status/_brief.cursor") == 1 ]] || fail "brief without --no-ack should ack to seq 1"
+CREW_HOME="$th" ./crew brief --plain | grep -q "you have not seen" && fail "acked events must not repeat"
+# tg-patch with no plugin installed must not crash
+CREW_HOME="$th" ./crew tg-patch >/dev/null 2>&1 || fail "tg-patch errored with no plugin dir"
+rm -rf "$th"
+
 echo "== pinger suites =="
 # These lived beside tick.py and had to be remembered individually, so a broken
 # one could sit green-by-omission. Globbed instead of listed: a new test_*.py
@@ -245,7 +297,7 @@ for t in pinger/test_*.py; do
 done
 
 echo "== doctor runs; setup --dry-run changes nothing =="
-./crew doctor >/dev/null || fail "doctor errored"
+env -u CREW_HOME ./crew doctor >/dev/null || fail "doctor errored"
 sdry=$(./crew setup --dry-run)
 grep -q "would symlink" <<<"$sdry" || fail "setup --dry-run didn't dry-run"
 

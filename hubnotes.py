@@ -76,7 +76,7 @@ def _fmt(r, now):
         age = "%dh" % h if h >= 1 else "%dm" % (h * 60)
     except Exception:
         pass
-    mark = "·" if r.get("state") == "open" else "✓"
+    mark = {"open": "·", "stale": "~"}.get(r.get("state"), "✓")
     txt = r.get("text", "").replace("\n", " ")
     if len(txt) > 110:
         txt = txt[:107] + "..."
@@ -140,6 +140,44 @@ def cmd_reopen(a):
     print("no note #%d" % a.id)
 
 
+def cmd_shelve(a):
+    """Open → stale for notes older than N hours. A stale note is kept, shown by
+    `all` with a ~, and no longer counts toward the pinger's STALLED rule — so a
+    backlog nobody is going to evidence stops nagging kaolin every idle stretch.
+    Not closed: closing needs evidence, and there is none."""
+    now = time.time()
+    rows = _rows()
+    n = 0
+    for r in rows:
+        if r.get("state") != "open":
+            continue
+        if a.app and r.get("app") != a.app:
+            continue
+        try:
+            t = time.mktime(time.strptime(r["sent"], "%Y-%m-%d %H:%M"))
+        except Exception:
+            continue
+        if now - t >= a.older * 3600:
+            r["state"] = "stale"
+            r["shelved"] = _stamp()
+            n += 1
+    if n:
+        _write(rows)
+    print("shelved %d note(s) open longer than %dh%s" % (n, a.older, (" in " + a.app) if a.app else ""))
+
+
+def cmd_unshelve(a):
+    rows = _rows()
+    for r in rows:
+        if r.get("id") == a.id and r.get("state") == "stale":
+            r["state"] = "open"
+            r.pop("shelved", None)
+            _write(rows)
+            print("reopened #%d" % a.id)
+            return
+    print("no stale note #%d" % a.id)
+
+
 def cmd_stale(a):
     now = time.time()
     cutoff = a.hours * 3600
@@ -191,6 +229,15 @@ def main():
     p = sub.add_parser("stale", help="open longer than N hours")
     p.add_argument("hours", nargs="?", type=int, default=12)
     p.set_defaults(fn=cmd_stale)
+
+    p = sub.add_parser("shelve", help="mark open notes older than N hours stale (kept, but no longer nag)")
+    p.add_argument("--older", type=int, default=168, help="hours (default 168 = a week)")
+    p.add_argument("app", nargs="?")
+    p.set_defaults(fn=cmd_shelve)
+
+    p = sub.add_parser("unshelve", help="stale -> open")
+    p.add_argument("id", type=int)
+    p.set_defaults(fn=cmd_unshelve)
 
     a = ap.parse_args()
     if not hasattr(a, "fn"):
