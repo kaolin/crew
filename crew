@@ -91,6 +91,12 @@ def shq(p):
     return "'" + p.replace("'", "'\\''") + "'"
 
 
+def _as_str(s):
+    """Escape for an AppleScript double-quoted literal. AppleScript eats backslashes,
+    so a command carrying `\\033` escape sequences arrives mangled without this."""
+    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
 def cmd_status(a):
     sessions = load(a.source, a.all)
     if not sessions:
@@ -131,6 +137,70 @@ def cmd_status(a):
                 line += c("2", "   ⟵ at prompt (bg task)")
             print(line)
         print()
+    if not a.source:
+        _report_unregistered(sessions)
+
+
+def _unregistered(sessions):
+    """claude processes running on this machine that `claude agents --json` does not list.
+
+    A session that fails to finish starting — the machine was locked when its window
+    opened, say — keeps its process and its iTerm window but never registers, so every
+    crew command is blind to it. Four sat unnoticed for a day that way (2026-09-02)."""
+    known = {str(s.get("pid")) for s in sessions}
+    out = []
+    try:
+        ps = subprocess.run(["ps", "-eo", "pid=,tty=,command="], capture_output=True, text=True).stdout
+    except Exception:
+        return out
+    for ln in ps.splitlines():
+        parts = ln.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, tty, cmd = parts
+        if not cmd.startswith("claude ") or pid in known:
+            continue
+        sid = cmd.split("--resume", 1)[1].split()[0] if "--resume" in cmd else "?"
+        out.append((pid, tty, sid))
+    return out
+
+
+def _report_unregistered(sessions):
+    rows = _unregistered(sessions)
+    if not rows:
+        return
+    print(c("33", f"  ⚠ {len(rows)} claude process(es) running but NOT registered — crew cannot see or drive these:"))
+    for pid, tty, sid in rows:
+        home = _cwd_of_session(sid)
+        print(f"      pid {pid:<7} {tty:<10} {proj(home) if home else '?':<16} {sid[:8]}")
+    print(c("2", "      they never finished startup, so crew is blind to them. Two known causes: the"))
+    print(c("2", "      trust-folder prompt (its default is 'No, exit'), and a window opened while the"))
+    print(c("2", "      screen was locked. Look at the window — answering the prompt registers it.\n"))
+
+
+def _cwd_of_session(sid):
+    """Recover a session's project from its transcript path under ~/.claude/projects."""
+    if not sid or sid == "?":
+        return None
+    root = os.path.join(HOME, ".claude", "projects")
+    try:
+        for d in os.listdir(root):
+            if not os.path.exists(os.path.join(root, d, sid + ".jsonl")):
+                continue
+            # The dir name encodes the cwd with every "/" AND "_" flattened to "-",
+            # so the decode is ambiguous (erif_html → .../erif/html). Prefer a path
+            # that actually exists; otherwise hand back the encoded name unchanged.
+            guess = "/" + d.strip("-").replace("-", "/")
+            if os.path.isdir(guess):
+                return guess
+            for i in range(len(guess) - 1, 0, -1):   # try "_" for each "/", right to left
+                alt = guess[:i] + "_" + guess[i + 1:] if guess[i] == "/" else None
+                if alt and os.path.isdir(alt):
+                    return alt
+            return d.strip("-")
+    except Exception:
+        pass
+    return None
 
 
 def cmd_snapshot(a):
@@ -147,8 +217,12 @@ def cmd_snapshot(a):
     manifest = []
     for s in sessions:
         tty = _tty_of(s.get("pid")) if wins else None
-        sp = (_window_space_for_session(s, tty, spaces, wins) if wins else None) \
-            or (_space_for_session(s, spaces) if spaces else None)
+        actual = _window_space_for_session(s, tty, spaces, wins) if wins else None
+        # The session's INTENDED home (alias file, then tag-label match), recorded
+        # alongside where the window actually sits. Without this the snapshot
+        # faithfully preserves a scattered layout and restore rebuilds it forever.
+        home = _space_for_session(s, spaces) if spaces else None
+        sp = actual or home
         manifest.append({
             "cwd": s.get("cwd"), "sessionId": s.get("sessionId"),
             "name": s.get("name"), "status": s.get("status"),
@@ -156,6 +230,9 @@ def cmd_snapshot(a):
             "space": sp.get("uuid") if sp else None,
             "spaceIndex": sp.get("index") if sp else None,
             "spaceTag": sp.get("tag") if sp else None,
+            "homeSpace": home.get("uuid") if home else None,
+            "homeSpaceIndex": home.get("index") if home else None,
+            "homeSpaceTag": home.get("tag") if home else None,
         })
     # Safety: never let an empty/shrunk read (e.g. the launchd tick firing during
     # shutdown, when sessions are already dying) clobber a good reboot map.
@@ -175,6 +252,40 @@ def cmd_snapshot(a):
         with open(os.path.join(hist, f"{int(time.time())}.json"), "w") as f:
             json.dump(manifest, f, indent=2)
     print(f"snapshotted {len(manifest)} sessions → {path}")
+    _report_space_drift(manifest)
+
+
+def _wherestr(index, tag):
+    """'Space 7 · thereby', or 'Space 14 (untagged)' — never '· None'."""
+    return f"Space {index} · {tag}" if tag else f"Space {index} (untagged)"
+
+
+def _report_space_drift(manifest):
+    """Say so when the layout being recorded is not the layout he meant.
+
+    Two separate faults, and silence on either one is how a scattered layout
+    becomes permanent: a window sitting somewhere other than its tagged home,
+    and a project with no home at all (nothing to restore it to)."""
+    drift = [m for m in manifest
+             if m.get("homeSpace") and m.get("space") and m["space"] != m["homeSpace"]]
+    homeless = [m for m in manifest if not m.get("homeSpace")]
+    if not drift and not homeless:
+        return
+    if drift:
+        print(c("33", f"\n  ⚠ {len(drift)} window(s) not on their tagged Space:"))
+        for m in drift:
+            print("      {:<20} on {}   → home is {}".format(
+                m.get("name") or "?",
+                _wherestr(m.get("spaceIndex"), m.get("spaceTag")),
+                _wherestr(m.get("homeSpaceIndex"), m.get("homeSpaceTag"))))
+        print(c("2", "      restore sends these home; `crew restore --as-found` keeps them where they are."))
+    if homeless:
+        print(c("33", f"\n  ⚠ {len(homeless)} session(s) with no Space tag — restore can only drop them wherever it is:"))
+        for m in homeless:
+            print("      {:<20} {}".format(m.get("name") or "?", proj(m.get("cwd"))))
+        print(c("2", f"      fix: tag a Space for it, or map it in {os.path.join(SNAP_DIR, 'space_aliases.json')}"))
+        print(c("2", '      e.g. {"fusiontrainer": "hidden game"}  (tag, index, or uuid)'))
+    print()
 
 
 def cmd_restore(a):
@@ -182,23 +293,51 @@ def cmd_restore(a):
     with open(path) as f:
         manifest = json.load(f)
     print(f"# restore {len(manifest)} sessions from {path}\n")
+    # Re-resolve each session's home against the LIVE Spaces rather than trusting the
+    # recorded position — a manifest taken while windows were scattered would otherwise
+    # rebuild the scatter every reboot. Live lookup also repairs old manifests, which
+    # have no homeSpace field, and picks up alias-file edits made since the snapshot.
+    spaces = [] if getattr(a, "as_found", False) else _spaces()
+    homeless = []
     launched = 0
     for s in manifest:
         cwd, sid, name = s.get("cwd"), s.get("sessionId"), s.get("name") or ""
         if not cwd or not sid:
             continue
-        space = s.get("space")
-        where = f"Space {s.get('spaceIndex')} · {s.get('spaceTag')}" if space else "current Space"
-        flagstr = "".join(" " + shq(f) for f in (s.get("launchArgs") or []))
-        resume = f"cd {shq(cwd)} && claude{flagstr} --resume {sid}"
+        space, moved = s.get("space"), None
+        home = _space_for_session(s, spaces) if spaces else None
+        if home and home.get("uuid") != space:
+            if space:
+                moved = "was on " + _wherestr(s.get("spaceIndex"), s.get("spaceTag"))
+            space, s = home["uuid"], {**s, "spaceIndex": home.get("index"), "spaceTag": home.get("tag")}
+        if spaces and not home:
+            homeless.append((name, proj(cwd)))
+        where = _wherestr(s.get("spaceIndex"), s.get("spaceTag")) if space else "current Space"
+        if moved:
+            where += c("2", f"   ({moved})")
+        # claude renders its own name into the window title, so `--name` is the only
+        # label it will never overwrite. Rewrite an existing one rather than skipping:
+        # the hub already launches with `--name hub` and would otherwise stay unlabelled.
+        args = list(s.get("launchArgs") or [])
+        label = label_name(cwd, name, manifest)
+        for i, x in enumerate(args):
+            if x in ("--name", "-n") and i + 1 < len(args):
+                args[i + 1] = label
+                break
+        else:
+            args += ["--name", label]
+        flagstr = "".join(" " + shq(f) for f in args)
+        tint = (_tab_escape(_tab_color_for(proj(cwd)), literal=True) + _BADGE_CLEAR_LITERAL
+                + _title_escape(label_name(cwd), literal=True))
+        resume = f"printf {shq(tint)} && cd {shq(cwd)} && claude{flagstr} --resume {sid}"
         if a.go:
             if space:
                 subprocess.run([_spacetag_bin(), "goto", str(space)])  # land the new window on its Space
             script = ('tell application "iTerm2"\n'
                       '  create window with default profile\n'
                       '  tell current session of current window\n'
-                      f'    set name to "{name}"\n'
-                      f'    write text "{resume}"\n'
+                      f'    set name to "{_as_str(name)}"\n'
+                      f'    write text "{_as_str(resume)}"\n'
                       '  end tell\n'
                       'end tell')
             subprocess.run(["osascript", "-e", script], check=False)
@@ -206,6 +345,11 @@ def cmd_restore(a):
         else:
             print(f"  would put {name.ljust(20)} → {where}   ({resume})")
         launched += 1
+    if homeless:
+        print(c("33", f"\n  ⚠ {len(homeless)} session(s) with no Space tag — left on whatever Space was current:"))
+        for name, p in homeless:
+            print("      {:<20} {}".format(name or "?", p))
+        print(c("2", f"      fix: tag a Space for it, or map it in {os.path.join(SNAP_DIR, 'space_aliases.json')}"))
     if not a.go:
         print(f"\n# dry-run: {launched} sessions. re-run with --go to open + place + resume.")
 
@@ -1278,6 +1422,118 @@ def cmd_setup(a):
     cmd_doctor(a)
 
 
+# ---- window labels: colour the tab so 15 near-identical windows tell apart ----
+#
+# Two halves, because they persist differently:
+#   colour — an iTerm2 escape written to the session's tty. Display-layer, so it does
+#            NOT reach the running claude's stdin, and it survives redraws. Live-settable.
+#   name   — claude rewrites its own terminal title continuously ("◐ hub (node)"), so an
+#            AppleScript `set name` is clobbered within a second. The only label that
+#            sticks is the one claude prints itself, via `--name`, so restore bakes it in
+#            and a live session keeps whatever name it launched with.
+
+_TAB_COLORS = {          # muted, one per project, stable across restores
+    "thereby":        (0, 122, 122),
+    "izzit":          (208, 88, 64),
+    "orrery":         (78, 86, 168),
+    "spinnit":        (198, 148, 32),
+    "fenriswatch":    (86, 110, 160),
+    "beatboxing":     (168, 72, 136),
+    "Sandpainting":   (150, 132, 72),
+    "autostereogram": (64, 140, 92),
+    "NamingRattle":   (128, 84, 160),
+    "spacetag":       (48, 132, 156),
+    "timeful":        (176, 96, 48),
+    "fusiontrainer":  (60, 120, 72),
+    "izzit_html":     (192, 112, 88),
+    "erif_html":      (140, 110, 90),
+    "dev":            (110, 110, 110),
+    "kaolin":         (90, 90, 90),
+}
+_TAB_FALLBACK = [(120, 96, 150), (72, 128, 140), (160, 112, 64), (100, 132, 96), (150, 88, 104)]
+_BADGE_CLEAR = "\033]1337;SetBadgeFormat=\a"
+_BADGE_CLEAR_LITERAL = "\\033]1337;SetBadgeFormat=\\a"
+_TAB_RESET = "\033]6;1;bg;*;default\a"
+
+
+def _tab_color_for(p):
+    if p in _TAB_COLORS:
+        return _TAB_COLORS[p]
+    return _TAB_FALLBACK[sum(ord(ch) for ch in (p or "?")) % len(_TAB_FALLBACK)]
+
+
+def _title_escape(text, literal=False):
+    """OSC 2 — WINDOW title only.
+
+    The three levels are separate and claude only drives two of them: it writes the
+    window title (a live summary of what it is doing, '✳ Moon's orbit in Cosmic Specks')
+    and the session name (its --name, 'orrery-04'). OSC 2 sets the window title alone,
+    so a static '[claude] <project>' can be pinned there. Note the cost: it replaces
+    claude's running summary for that window until the next time claude rewrites it."""
+    esc, bel = ("\\033", "\\a") if literal else ("\033", "\a")
+    return f"{esc}]2;{text}{bel}"
+
+
+def _tab_escape(rgb, literal=False):
+    """The escape run. literal=True emits backslash sequences for a shell `printf`
+    format instead of raw control bytes, so the command can be typed into a window."""
+    esc, bel = ("\\033", "\\a") if literal else ("\033", "\a")
+    r, g, b = rgb
+    return "".join(f"{esc}]6;1;bg;{chan};brightness;{v}{bel}"
+                   for chan, v in (("red", r), ("green", g), ("blue", b)))
+
+
+def _write_tty(tty, s):
+    """Write to a session's terminal device. Goes to the display, not the app's stdin."""
+    if not tty:
+        return False
+    dev = tty if tty.startswith("/dev/") else "/dev/" + tty   # _tty_of already absolutises
+    try:
+        with open(dev, "w") as f:
+            f.write(s)
+        return True
+    except Exception:
+        return False
+
+
+def label_name(cwd, name=None, sessions=None):
+    """`[claude] <project>`, falling back to the session name when two live sessions
+    share a project — otherwise hub and kaolin-a6 (both cwd ~) get the same title."""
+    p = proj(cwd)
+    if sessions and name and sum(1 for s in sessions if proj(s.get("cwd")) == p) > 1:
+        return "[claude] " + name
+    return "[claude] " + p
+
+
+def cmd_label(a):
+    sessions = load(None, include_all=False)
+    done, missed = [], []
+    for s in sessions:
+        tty = _tty_of(s.get("pid"))
+        p = proj(s.get("cwd"))
+        if a.clear:
+            payload = _TAB_RESET + _BADGE_CLEAR
+        else:
+            payload = _tab_escape(_tab_color_for(p)) + _BADGE_CLEAR
+            if not a.no_title:
+                payload += _title_escape(label_name(s.get("cwd"), s.get("name"), sessions))
+        (done if _write_tty(tty, payload) else missed).append((s.get("name"), p, tty))
+    verb = "reset" if a.clear else "coloured"
+    print(f"\n  {verb} {len(done)} window(s)" + (" (badges cleared)" if not a.clear else "") + "\n")
+    for name, p, tty in done:
+        swatch = "" if a.clear else c("48;2;{};{};{}".format(*_tab_color_for(p)), "   ") + " "
+        print(f"      {swatch}{(name or '?').ljust(20)} {p.ljust(16)} {tty}")
+    if missed:
+        print(c("33", f"\n  ⚠ {len(missed)} window(s) unreachable (no tty — tmux pane, or not an iTerm session):"))
+        for name, p, tty in missed:
+            print(f"      {(name or '?').ljust(20)} {p.ljust(16)} {tty or '-'}")
+    if not a.clear and not a.no_title:
+        print(c("2", "\n      window title pinned to `[claude] <project>` (OSC 2). That replaces claude's"))
+        print(c("2", "      running summary for the window; re-run `crew label` if claude takes it back."))
+        print(c("2", "      session name still shows claude's own `--name`. `--no-title` colours only."))
+    print()
+
+
 def cmd_doctor(a):
     def check(label, ok, detail=""):
         mark = c("32", "✓") if ok else c("31", "✗")
@@ -1399,6 +1655,8 @@ def main():
     pr = sub.add_parser("restore", help="resume every session from a manifest into fresh iTerm2 windows")
     pr.add_argument("--source", help=f"manifest path (default {SNAP_DIR}/latest.json)")
     pr.add_argument("--go", action="store_true", help="actually open windows (default: dry-run)")
+    pr.add_argument("--as-found", dest="as_found", action="store_true",
+                    help="rebuild the recorded layout verbatim; skip sending drifted windows home")
     pr.set_defaults(fn=cmd_restore)
     pk = sub.add_parser("peek", help="show a session's recent conversation (read-only, any terminal)")
     pk.add_argument("name")
@@ -1446,6 +1704,11 @@ def main():
     pu = sub.add_parser("setup", help="symlink crew onto PATH + install the snapshot agent")
     pu.add_argument("--dry-run", action="store_true", help="print what it would do, change nothing")
     pu.set_defaults(fn=cmd_setup)
+    pl = sub.add_parser("label", help="colour every session's iTerm tab by project (and clear badges)")
+    pl.add_argument("--clear", action="store_true", help="reset tab colours and badges instead")
+    pl.add_argument("--no-title", dest="no_title", action="store_true",
+                    help="colour only; leave claude's live window title alone")
+    pl.set_defaults(fn=cmd_label)
     ps2 = sub.add_parser("doctor", help="check deps (claude, spacetag, iTerm2, PATH, agent)")
     ps2.set_defaults(fn=cmd_doctor)
     ptu = sub.add_parser("tg-unactioned", help="Telegram inbound logged but not yet confirmed actioned by the hub")
