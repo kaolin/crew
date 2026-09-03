@@ -13,7 +13,7 @@ Subcommands:
 
 stdlib only — no pip/conda env needed.
 """
-import sys, os, json, time, subprocess, argparse, shutil, re, calendar
+import sys, os, io, json, time, datetime, subprocess, argparse, shutil, re, calendar
 
 HOME = os.path.expanduser("~")
 SNAP_DIR = os.path.join(HOME, ".crew")
@@ -27,6 +27,40 @@ TG_DIR           = os.path.join(HOME, ".claude", "channels", "telegram")
 TG_INBOUND       = os.path.join(TG_DIR, "inbound.jsonl")
 TG_ACTIONED      = os.path.join(TG_DIR, "actioned.cursor")
 TG_REVIEW_WINDOW = 48 * 3600   # tg-unactioned ignores records older than this unless --all
+
+# The telegram plugin ships without durable inbound logging, quote-reply
+# passthrough, and edit/reaction handlers. We patch its server.ts to add them --
+# and because the plugin lives in a CACHE dir, every plugin update silently
+# reverts it (0.0.6 -> 0.0.7 on 2026-08-19 cost two days of blind replies,
+# edits and reactions, and a frozen inbound.jsonl). `crew tg-patch` detects the
+# revert and re-applies. See hub-protocol.md "Never miss a message".
+TG_PLUGIN_DIR = os.path.join(HOME, ".claude", "plugins", "cache",
+                             "claude-plugins-official", "telegram")
+# Resolved without __file__: the pinger tests exec() this file, where it is undefined.
+TG_PATCH_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(globals().get("__file__") or sys.argv[0])), "tgpatch")
+# Every marker must appear in server.ts or the patch is considered reverted.
+# --- session status + wake briefing -----------------------------------------
+# Sessions write one file each at the end of every turn. The hub reads the whole
+# directory as its FIRST act on any wake — which is the entire fix for "only
+# kaolin can wake the hub": it stops mattering, because the moment he says
+# anything the hub already knows what finished and who is blocked.
+# Schema and rationale: docs/session-status.md
+STATUS_DIR   = os.path.join(HOME, ".claude", "status")
+# The pinger already detects finished/stuck/waiting every minute but only pushes
+# to Telegram, where its own messages never come back as inbound. It now also
+# appends here, giving the hub a durable queue to catch up from.
+PINGER_QUEUE = os.path.join(HOME, ".claude", "status", "_pinger.jsonl")
+BRIEF_CURSOR = os.path.join(HOME, ".claude", "status", "_brief.cursor")
+
+TG_PATCH_MARKERS = [
+    ("durable inbound log", "INBOUND_LOG"),
+    ("actioned-cursor replay", "ACTIONED_FILE"),
+    ("quote-reply passthrough", "reply_to_message_id"),
+    ("edit handler", "edited_message:text"),
+    ("reaction handler", "message_reaction"),
+    ("allowed_updates", "allowed_updates"),
+]
 
 # lower rank = more urgent / sorts first
 STATUS_RANK = {"waiting": 0, "busy": 1, "idle": 2, "completed": 3, "stopped": 4, "failed": 5}
@@ -1650,6 +1684,241 @@ def cmd_tg_actioned(a):
     print(f"actioned.cursor = {target}  (max logged = {mx})")
 
 
+def _tg_plugin_versions():
+    """Installed telegram plugin version dirs, oldest-looking first."""
+    try:
+        vs = [d for d in os.listdir(TG_PLUGIN_DIR)
+              if os.path.isdir(os.path.join(TG_PLUGIN_DIR, d))]
+    except OSError:
+        return []
+    return sorted(vs, key=lambda v: [int(x) if x.isdigit() else 0
+                                     for x in v.split(".")])
+
+
+def _tg_patch_state(version):
+    """(server_path, [missing marker names]) -- missing is None if no server.ts."""
+    sp = os.path.join(TG_PLUGIN_DIR, version, "server.ts")
+    if not os.path.exists(sp):
+        return sp, None
+    src = io.open(sp, encoding="utf-8", errors="replace").read()
+    return sp, [name for name, marker in TG_PATCH_MARKERS if marker not in src]
+
+
+def _tg_running_poller():
+    pidf = os.path.join(TG_DIR, "bot.pid")
+    try:
+        return int(io.open(pidf).read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _age(iso):
+    """'3h ago' from an ISO timestamp, or '?' if unparseable."""
+    if not iso:
+        return "?"
+    t = str(iso).strip().replace("Z", "+00:00")
+    try:
+        when = datetime.datetime.fromisoformat(t)
+    except ValueError:
+        return "?"
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    secs = (datetime.datetime.now(datetime.timezone.utc) - when).total_seconds()
+    if secs < 90:
+        return "just now"
+    if secs < 5400:
+        return "%dm ago" % (secs // 60)
+    if secs < 172800:
+        return "%.0fh ago" % (secs / 3600)
+    return "%.0fd ago" % (secs / 86400)
+
+
+def _status_files():
+    try:
+        names = sorted(os.listdir(STATUS_DIR))
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        if not n.endswith(".json") or n.startswith("_"):
+            continue
+        p = os.path.join(STATUS_DIR, n)
+        try:
+            out.append((n[:-5], json.load(io.open(p, encoding="utf-8"))))
+        except Exception as e:
+            out.append((n[:-5], {"_unreadable": str(e)}))
+    return out
+
+
+def _listish(d, *keys):
+    """First non-empty list found under any of `keys`."""
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, list) and v:
+            return v
+        if isinstance(v, str) and v.strip():
+            return [v]
+    return []
+
+
+def _pinger_events(since):
+    try:
+        lines = io.open(PINGER_QUEUE, encoding="utf-8").read().splitlines()
+    except OSError:
+        return [], since
+    out, mx = [], since
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        seq = rec.get("seq", 0)
+        if seq > since:
+            out.append(rec)
+        mx = max(mx, seq)
+    return out, mx
+
+
+def cmd_brief(a):
+    """Wake briefing: what every session last said, and what the pinger saw."""
+    C = (lambda code, t: t) if a.plain else (lambda code, t: "\033[%sm%s\033[0m" % (code, t))
+
+    try:
+        since = int(io.open(BRIEF_CURSOR).read().strip())
+    except (OSError, ValueError):
+        since = 0
+    events, mx = _pinger_events(since)
+    if events:
+        print(C("1", "PINGER — %d event(s) you have not seen" % len(events)))
+        for e in events[-20:]:
+            print("  %-9s %-18s %s" % (_age(e.get("ts")), e.get("session", "?"),
+                                       (e.get("text") or "").replace("\n", " ")[:90]))
+        print("")
+
+    files = _status_files()
+    if not files:
+        print("no session status files in " + STATUS_DIR)
+    else:
+        moves, waits, quiet = [], [], []
+        for name, d in files:
+            if d.get("_unreadable"):
+                quiet.append((name, d, "unreadable: " + d["_unreadable"]))
+                continue
+            decisions = _listish(d, "needs_decision", "your_move")
+            blockers = _listish(d, "blockers", "blocked_on")
+            if decisions:
+                moves.append((name, d, decisions))
+            elif blockers:
+                waits.append((name, d, blockers))
+            else:
+                quiet.append((name, d, d.get("last_action") or d.get("summary") or ""))
+
+        if moves:
+            print(C("35;1", "NEEDS KAOLIN — %d" % len(moves)))
+            for name, d, items in moves:
+                print("  %s  %s" % (C("1", name), C("2", _age(d.get("updated_at")))))
+                for it in items:
+                    print("     · %s" % str(it)[:160])
+            print("")
+        if waits:
+            print(C("33;1", "BLOCKED ON SOMETHING ELSE — %d" % len(waits)))
+            for name, d, items in waits:
+                print("  %s  %s" % (C("1", name), C("2", _age(d.get("updated_at")))))
+                for it in items:
+                    print("     · %s" % str(it)[:160])
+            print("")
+        if quiet:
+            print(C("32", "QUIET — %d" % len(quiet)))
+            for name, d, line in quiet:
+                print("  %-16s %-9s %s" % (name, _age(d.get("updated_at")), str(line)[:100]))
+            print("")
+
+        stale = [(n, d) for n, d in files
+                 if isinstance(d.get("device"), dict) and d["device"].get("stale")]
+        if stale:
+            print(C("31;1", "DEVICE STALE — kaolin may be testing code that no longer exists"))
+            for n, d in stale:
+                dev = d["device"]
+                print("  %-16s %s: shipped %s vs head %s" %
+                      (n, dev.get("name", "?"), dev.get("shipped_commit", "?"), d.get("head", "?")))
+            print("")
+
+        unpushed = [(n, d.get("unpushed")) for n, d in files if d.get("unpushed")]
+        if unpushed:
+            print(C("36", "UNPUSHED WORK"))
+            for n, u in unpushed:
+                print("  %-16s %s" % (n, ", ".join(str(x) for x in u)[:100]))
+            print("")
+
+    if not a.no_ack and mx > since:
+        os.makedirs(STATUS_DIR, exist_ok=True)
+        tmp = BRIEF_CURSOR + ".tmp"
+        io.open(tmp, "w").write(str(mx) + "\n")
+        os.replace(tmp, BRIEF_CURSOR)
+
+
+def cmd_tg_patch(a):
+    """Check -- and with --apply, restore -- the local telegram server.ts patch."""
+    versions = _tg_plugin_versions()
+    if not versions:
+        print("no telegram plugin found under " + TG_PLUGIN_DIR)
+        return
+
+    need = []
+    for v in versions:
+        sp, missing = _tg_patch_state(v)
+        if missing is None:
+            print("  %s: no server.ts" % v)
+        elif missing:
+            print("  %s: REVERTED -- missing %s" % (v, ", ".join(missing)))
+            need.append((v, sp))
+        else:
+            print("  %s: patched" % v)
+
+    if not need:
+        print("all installed versions carry the patch")
+        return
+    if not a.apply:
+        print("")
+        print("re-apply with: crew tg-patch --apply")
+        return
+
+    patch = os.path.join(TG_PATCH_DIR, "local.patch")
+    inbound = os.path.join(TG_PATCH_DIR, "inbound-log.ts")
+    if not os.path.exists(patch):
+        print("missing %s -- cannot re-apply" % patch)
+        return
+
+    for v, sp in need:
+        vdir = os.path.dirname(sp)
+        shutil.copy2(sp, sp + ".orig-" + v)
+        if os.path.exists(inbound):
+            shutil.copy2(inbound, os.path.join(vdir, "inbound-log.ts"))
+        with io.open(patch) as fh:
+            r = subprocess.run(["patch", "-p0", "-N", sp], stdin=fh,
+                               capture_output=True, text=True)
+        if r.returncode != 0:
+            print("  %s: FAILED -- %s" % (v, (r.stderr or r.stdout).strip()[:200]))
+            continue
+        _, missing = _tg_patch_state(v)
+        if missing:
+            print("  %s: applied but still missing %s -- inspect by hand"
+                  % (v, ", ".join(missing)))
+        else:
+            print("  %s: applied (stock kept as server.ts.orig-%s)" % (v, v))
+
+    print("")
+    print("Takes effect only on a NEW poller. /reload-plugins does NOT restart it:")
+    print("quit and reopen the session, or kill the bot.pid process from a")
+    print("terminal that does not need the channel.")
+    pid = _tg_running_poller()
+    if pid:
+        print("current poller: pid %d" % pid)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="crew", description="read-only status + restore for your Claude sessions")
     ap.set_defaults(fn=cmd_status, source=None, all=False, go=False, out=None)
@@ -1730,6 +1999,17 @@ def main():
     ptu = sub.add_parser("tg-unactioned", help="Telegram inbound logged but not yet confirmed actioned by the hub")
     ptu.add_argument("--all", action="store_true", help="include records older than the 48h review window")
     ptu.set_defaults(fn=cmd_tg_unactioned)
+    pb = sub.add_parser("brief",
+        help="wake briefing: every session's status file + unseen pinger events")
+    pb.add_argument("--plain", action="store_true", help="no ANSI colour")
+    pb.add_argument("--no-ack", action="store_true",
+        help="do not advance the seen-cursor for pinger events")
+    pb.set_defaults(fn=cmd_brief)
+    ptp = sub.add_parser("tg-patch",
+        help="check (or --apply) the local telegram plugin patch that updates revert")
+    ptp.add_argument("--apply", action="store_true",
+        help="re-apply the patch to any reverted version")
+    ptp.set_defaults(fn=cmd_tg_patch)
     pta = sub.add_parser("tg-actioned", help="mark Telegram inbound handled up through <seq> (or 'latest')")
     pta.add_argument("seq", help="a seq number, or 'latest' to mark everything logged as actioned")
     pta.set_defaults(fn=cmd_tg_actioned)
