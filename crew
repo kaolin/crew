@@ -718,28 +718,31 @@ class ITerm2ApiAdapter:
         except Exception:
             return None
 
+    # Any non-zero answer falls back to AppleScript, INCLUDING "no session on that
+    # tty" (rc 2): the API's tty variable did not match /dev/ttys046 for a session
+    # AppleScript found fine (thereby-8e, 2026-09-03 13:36, a relay bounced). The
+    # API is an accelerator, never the arbiter of whether a session exists.
+
     def peek(self, tty):
         r = self._run("peek", tty)
-        if r is None or r.returncode == 3 or r.returncode == 4:
-            return _ITERM2.peek(tty)          # API unreachable → Apple Events, slowly
-        return None if r.returncode == 2 else r.stdout
+        if r is None or r.returncode != 0:
+            return _ITERM2.peek(tty)
+        return r.stdout
 
     def tell(self, tty, msg):
         r = self._run("send", tty, msg, timeout=30)
-        if r is None or r.returncode in (3, 4):
+        if r is None or r.returncode != 0:
             return _ITERM2.tell(tty, msg)
-        if r.returncode != 0:
-            return False
         if "\n" in msg or len(msg) > 400:
             time.sleep(settle_for(msg))
         r2 = self._run("send", tty, "\r")
-        return bool(r2 and r2.returncode == 0)
+        return bool(r2 and r2.returncode == 0) or _ITERM2.keys(tty, "\r")
 
     def keys(self, tty, chunk):
         r = self._run("send", tty, chunk)
-        if r is None or r.returncode in (3, 4):
+        if r is None or r.returncode != 0:
             return _ITERM2.keys(tty, chunk)
-        return r.returncode == 0
+        return True
 
     def jump(self, tty):
         return _ITERM2.jump(tty)               # window fronting stays on AppleScript
