@@ -365,6 +365,15 @@ def cmd_restore(a):
     # have no homeSpace field, and picks up alias-file edits made since the snapshot.
     spaces = [] if getattr(a, "as_found", False) else _spaces(getattr(a, "spaces_source", None))
     homeless = []
+    # A window opened by AppleScript while the login screen is up never starts its
+    # shell (2026-09-03 12:05: "✓ orrery → Space 12", no login process, no claude,
+    # an empty pane until unlock). Refuse rather than leave a trail of dead windows;
+    # the operator can type the launch into an existing idle shell by tty instead.
+    if a.go and _screen_locked() and not getattr(a, "even_locked", False):
+        print(c("31", "  screen is locked — windows opened now never start their shell. "
+                      "Unlock first, or type the launch into an existing idle shell by tty. "
+                      "(--even-locked to try anyway)"))
+        return
     # Folders that will stop at the trust dialog. Say so up front; after --go, answer it.
     untrusted = [(s.get("sessionId"), s.get("cwd")) for s in manifest
                  if s.get("cwd") and s.get("sessionId") and _trusted(s["cwd"]) is False]
@@ -2375,6 +2384,8 @@ def main():
     pr.add_argument("--as-found", dest="as_found", action="store_true",
                     help="rebuild the recorded layout verbatim; skip sending drifted windows home")
     pr.add_argument("--spaces-source", dest="spaces_source", help="spaces JSON (testing; default: live `spacetag dump`)")
+    pr.add_argument("--even-locked", dest="even_locked", action="store_true",
+                    help="open windows even though the screen is locked (they usually never start)")
     pr.set_defaults(fn=cmd_restore)
     plk = sub.add_parser("locked", help="is the login screen up? (exit 0 locked / 1 unlocked)")
     plk.set_defaults(fn=cmd_locked)
