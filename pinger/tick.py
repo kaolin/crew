@@ -250,6 +250,39 @@ def _clean(text):
 API_ERROR_RE = re.compile(r"API Error|\b5(?:29|0[0-9])\b|Overloaded|overloaded_error|rate.?limit", re.I)
 
 
+def sent_to_hub(path, since_epoch, tail_lines=TAIL_LINES):
+    """True when an assistant turn since `since_epoch` called SendMessage with the
+    hub as recipient — the report went to the hub, not to the screen."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            rows = fh.readlines()[-tail_lines:]
+    except OSError:
+        return False
+    for ln in reversed(rows):
+        if '"SendMessage"' not in ln:
+            continue
+        try:
+            d = json.loads(ln)
+        except Exception:
+            continue
+        if d.get("type") != "assistant":
+            continue
+        ts = d.get("timestamp") or ""
+        try:
+            ep = calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
+            if ep < (since_epoch or 0) - 60:
+                return False               # older than this busy episode; stop looking
+        except ValueError:
+            pass
+        content = (d.get("message") or {}).get("content") or []
+        for b in content if isinstance(content, list) else []:
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "SendMessage":
+                to = str((b.get("input") or {}).get("to") or "").lower()
+                if "hub" in to:
+                    return True
+    return False
+
+
 def api_error_ending(lines):
     """True when the transcript's closing message is an API failure rather than a
     report — the session went idle because the turn was dropped."""
@@ -975,6 +1008,14 @@ def main():
                 tpath = transcript_path(s.get("cwd"), sid)
                 lines = last_gist(tpath)
                 shots = find_artifacts(tpath, p["busy_since"]) if SEND_PHOTOS else []
+                if sent_to_hub(tpath, p["busy_since"]):
+                    # The turn ended by handing its report to the hub, so its last
+                    # message is addressed to the hub ("Sent. I built him a clean
+                    # packet…"). The hub forwards the real report with the files;
+                    # pasting the note-to-hub here gave kaolin the hub's version and
+                    # then "the hub's version back to the agent" (2026-09-03 14:34).
+                    lines = [(False, "report delivered via the hub — see the hub's message")]
+                    shots = []
                 if api_error_ending(lines):
                     # busy→idle because the API dropped the turn, not because the
                     # work finished. Saying "finished" here sent kaolin a ✅ whose
