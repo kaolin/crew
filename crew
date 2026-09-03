@@ -177,8 +177,9 @@ def cmd_status(a):
         print()
     if not a.source:
         _report_unregistered(sessions)
-        if _screen_locked():
-            print(c("2", "  (screen locked — no screen probes, so 'at prompt' and 'pending' read from transcripts only)\n"))
+        if _screen_locked() and not _probes_ok():
+            print(c("2", "  (screen locked and Apple Events are crawling — no screen probes; 'at prompt' and 'pending'"
+                         " read from transcripts only. Fix: defaults write com.googlecode.iterm2 NSAppSleepDisabled -bool YES)\n"))
 
 
 def _unregistered(sessions):
@@ -253,7 +254,10 @@ def cmd_snapshot(a):
     # is fetched once and shared. Skip live probes (winspace, launch-flag capture) in
     # test mode (--source given → fixture sessions with non-live pids).
     testmode = bool(a.source)
-    wins = _windows() if (spaces and not testmode) else None
+    # Window geometry is an Apple Event that takes 40–60 s while the screen is
+    # locked (measured 2026-09-03); the agent would spend minutes per tick.
+    # Locked → record the tagged home only; the next unlocked tick refreshes.
+    wins = _windows() if (spaces and not testmode and not _screen_locked()) else None
     manifest = []
     for s in sessions:
         tty = _tty_of(s.get("pid")) if wins else None
@@ -296,6 +300,16 @@ def cmd_snapshot(a):
     # otherwise the same 15-line warning lands in snapshot.log 288 times a day.
     if sys.stdout.isatty() or a.verbose or _drift_sets(manifest) != _drift_sets(prev):
         _report_space_drift(manifest)
+    # The agent also keeps a finger on Tahoe's AppleScript regression: one timed
+    # Apple Event, at most every 15 minutes, so `crew regression` can show whether
+    # a macOS update fixed it. Interactive runs skip it (it can take 45 s locked).
+    if not sys.stdout.isatty() and not a.source:
+        try:
+            fresh = os.path.exists(AE_LATENCY_LOG) and time.time() - os.path.getmtime(AE_LATENCY_LOG) < 900
+        except OSError:
+            fresh = False
+        if not fresh:
+            _sample_ae_latency()
 
 
 def _drift_sets(manifest):
@@ -671,6 +685,76 @@ class ITerm2Adapter:
 _ITERM2 = ITerm2Adapter()
 
 
+IT2_PY = os.path.join(os.path.dirname(os.path.abspath(globals().get("__file__") or sys.argv[0])), "it2.py")
+IT2_PYTHON = os.environ.get("CREW_IT2_PYTHON") or os.path.expanduser("~/miniconda3/bin/python")
+_IT2_OK = None   # per-process: did the API answer? None = not asked yet
+
+
+class ITerm2ApiAdapter:
+    """Drive iTerm2 through its Python API (a websocket over a Unix socket) via
+    it2.py, instead of Apple Events.
+
+    Why: on macOS 26 with the login screen up, EVERY Apple Event to iTerm2 takes
+    4–60 s (measured 2026-09-03: 4.9, 4.1, 15.6, 34, >60 s), and the AppleScript
+    adapter spends one event per session just to find a tty. The API reads a
+    screen in ~1 s locked or not. Its only Apple-Event dependency is the login
+    cookie; `it2.py mint` fetches one while unlocked and caches it in ~/.crew.
+
+    Falls back to the AppleScript adapter for anything it cannot do."""
+    name = "iTerm2-api"
+
+    def _run(self, *args, timeout=20):
+        try:
+            return subprocess.run([IT2_PYTHON, IT2_PY, *args], capture_output=True, text=True, timeout=timeout)
+        except Exception:
+            return None
+
+    def peek(self, tty):
+        r = self._run("peek", tty)
+        if r is None or r.returncode == 3 or r.returncode == 4:
+            return _ITERM2.peek(tty)          # API unreachable → Apple Events, slowly
+        return None if r.returncode == 2 else r.stdout
+
+    def tell(self, tty, msg):
+        r = self._run("send", tty, msg, timeout=30)
+        if r is None or r.returncode in (3, 4):
+            return _ITERM2.tell(tty, msg)
+        if r.returncode != 0:
+            return False
+        if "\n" in msg or len(msg) > 400:
+            time.sleep(settle_for(msg))
+        r2 = self._run("send", tty, "\r")
+        return bool(r2 and r2.returncode == 0)
+
+    def keys(self, tty, chunk):
+        r = self._run("send", tty, chunk)
+        if r is None or r.returncode in (3, 4):
+            return _ITERM2.keys(tty, chunk)
+        return r.returncode == 0
+
+    def jump(self, tty):
+        return _ITERM2.jump(tty)               # window fronting stays on AppleScript
+
+    def bounds(self, tty):
+        return _ITERM2.bounds(tty)
+
+
+_ITERM2_API = ITerm2ApiAdapter()
+
+
+def _it2_available():
+    """True when it2.py can reach iTerm2 within its budget. Asked once per
+    process; a locked screen with no cached cookie answers 'no' in ~6 s and
+    everything then goes the AppleScript way, as before."""
+    global _IT2_OK
+    if _IT2_OK is None:
+        _IT2_OK = False
+        if os.path.exists(IT2_PY) and os.path.exists(IT2_PYTHON):
+            r = _ITERM2_API._run("ping", timeout=12)
+            _IT2_OK = bool(r and r.returncode == 0)
+    return _IT2_OK
+
+
 class TmuxAdapter:
     """Drive a claude running inside a tmux pane (any socket) via tmux itself.
     Bound to a resolved (socket, target); `adapter_for` builds one per tmux tty."""
@@ -757,7 +841,9 @@ def adapter_for(tty):
     """Pick the dispatch backend for a session's tty: a TmuxAdapter when the tty
     belongs to a tmux pane (any socket), else iTerm2."""
     pane = _tmux_pane_of(tty)
-    return TmuxAdapter(*pane) if pane else _ITERM2
+    if pane:
+        return TmuxAdapter(*pane)
+    return _ITERM2_API if _it2_available() else _ITERM2
 
 
 # ---- spaces: leverage spacetag's CLI to switch to a session's Space ----
@@ -1050,11 +1136,37 @@ def _screen_locked():
     return _LOCKED
 
 
+_PROBES_OK = None
+
+
+def _probes_ok():
+    """May we screen-scrape right now? Unlocked: always. Locked: only if one
+    trial Apple Event comes back fast.
+
+    The root cause of the locked-screen crawl (2026-09-03) was App Nap: with the
+    login screen up iTerm2 is a background app, macOS naps it, and every Apple
+    Event to it takes 4–60 s. `defaults write com.googlecode.iterm2
+    NSAppSleepDisabled -bool YES` takes that to 0.05 s. This probe is the guard
+    for the day that setting is missing or the OS changes again: a slow trial
+    means skip the scrape (callers fall back to transcripts) rather than hang."""
+    global _PROBES_OK
+    if _PROBES_OK is None:
+        # Measured 2026-09-03 09:25, screen locked, App Nap already off for
+        # iTerm2: `get version` 0.05 s; `count of sessions` 0.8 s; `contents of
+        # session` by tty 0.75 s once and 30+ s the next two times; `bounds of
+        # window` and `name of current window` 40–60 s every time. A cheap trial
+        # event therefore proves nothing about the next one. While locked, the
+        # transcript is the only source that answers in bounded time — so no
+        # scraping at all, and the snapshot agent must not ask for window bounds.
+        _PROBES_OK = not _screen_locked()
+    return _PROBES_OK
+
+
 def _screen_tail(s, lines=18):
     """Last N lines of the session's live terminal, or [] if not scrapeable.
     The transcript is structured but lags; the screen is what's actually asking."""
-    if _screen_locked():
-        return []   # would hang for ~15 s per session; the caller falls back to the transcript
+    if not _probes_ok():
+        return []   # Apple Events are crawling; the caller falls back to the transcript
     try:
         tty = _tty_of(s.get("pid"))
         if not tty:
@@ -1331,8 +1443,8 @@ def cmd_at_prompt(a):
     if not s:
         print(f"{a.name}: no such session", file=sys.stderr)
         sys.exit(2)
-    if _screen_locked():
-        print(f"{s.get('name')}: cannot look — screen locked", file=sys.stderr)
+    if not _probes_ok():
+        print(f"{s.get('name')}: cannot look — screen locked and Apple Events are crawling", file=sys.stderr)
         sys.exit(3)
     rows = _screen_tail(s, lines=12)
     ready = at_prompt(s, rows)
@@ -1678,6 +1790,85 @@ def cmd_label(a):
         print(c("2", "\n      window title pinned to `[claude] <project>` (OSC 2). That replaces claude's"))
         print(c("2", "      running summary for the window; re-run `crew label` if claude takes it back."))
         print(c("2", "      session name still shows claude's own `--name`. `--no-title` colours only."))
+    print()
+
+
+AE_LATENCY_LOG = os.path.join(SNAP_DIR, "ae-latency.tsv")
+
+
+def _ae_latency(timeout=45):
+    """Seconds for ONE trivial Apple Event to iTerm2 (`get version`), or None on
+    timeout. This is the number Tahoe's regression inflates under a locked screen."""
+    t0 = time.time()
+    try:
+        r = subprocess.run(["osascript", "-e", 'tell application "iTerm2" to get version'],
+                           capture_output=True, text=True, timeout=timeout)
+        return round(time.time() - t0, 2) if r.returncode == 0 else None
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def _macos_build():
+    try:
+        return subprocess.run(["sw_vers", "-buildVersion"], capture_output=True, text=True).stdout.strip()
+    except Exception:
+        return "?"
+
+
+def _sample_ae_latency():
+    """Append one row: ts, locked, seconds (or 'timeout'), macOS build. Called by the
+    snapshot agent, so the log accumulates a picture across lock states and OS
+    updates without anyone remembering to measure."""
+    secs = _ae_latency()
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    with open(AE_LATENCY_LOG, "a") as f:
+        f.write("%s\t%d\t%s\t%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), 1 if _screen_locked() else 0,
+                                     secs if secs is not None else "timeout", _macos_build()))
+    return secs
+
+
+def cmd_regression(a):
+    """A finger on Tahoe's AppleScript regression: is it still there, and is a
+    macOS update available that might fix it? Reads the sampled log; with
+    --sample takes one measurement now; with --check-update asks softwareupdate
+    (network, ~30 s)."""
+    if a.sample:
+        s = _sample_ae_latency()
+        print(f"  one Apple Event to iTerm2 just now: {s if s is not None else 'timeout'} s "
+              f"({'locked' if _screen_locked() else 'unlocked'})")
+    rows = []
+    try:
+        for ln in open(AE_LATENCY_LOG):
+            parts = ln.rstrip("\n").split("\t")
+            if len(parts) == 4:
+                rows.append(parts)
+    except OSError:
+        pass
+    print(f"\n  macOS build {_macos_build()} · {len(rows)} sample(s) in {AE_LATENCY_LOG}")
+    for lock_flag, label in (("0", "unlocked"), ("1", "locked")):
+        vals = [r for r in rows if r[1] == lock_flag]
+        if not vals:
+            print(f"  {label:<9} no samples yet")
+            continue
+        nums = sorted(float(r[2]) for r in vals if r[2] != "timeout")
+        tmo = sum(1 for r in vals if r[2] == "timeout")
+        med = nums[len(nums) // 2] if nums else None
+        worst = nums[-1] if nums else None
+        by_build = {}
+        for r in vals:
+            by_build.setdefault(r[3], []).append(r[2])
+        print(f"  {label:<9} n={len(vals)}  median={med if med is not None else '—'} s  worst={worst if worst is not None else '—'} s  timeouts={tmo}"
+              + ("   builds: " + ", ".join(sorted(by_build)) if len(by_build) > 1 else ""))
+    print(c("2", "\n  fixed looks like: locked median falling from seconds to ~0.1 s on a new build."))
+    if a.check_update:
+        print(c("2", "\n  asking softwareupdate (network)…"))
+        try:
+            out = subprocess.run(["softwareupdate", "--list"], capture_output=True, text=True, timeout=120)
+            body = (out.stdout + out.stderr).strip()
+            hits = [ln.strip() for ln in body.splitlines() if "macOS" in ln]
+            print("  " + ("\n  ".join(hits) if hits else "no macOS update listed"))
+        except Exception as e:
+            print(f"  softwareupdate failed: {e}")
     print()
 
 
@@ -2187,6 +2378,10 @@ def main():
     pr.set_defaults(fn=cmd_restore)
     plk = sub.add_parser("locked", help="is the login screen up? (exit 0 locked / 1 unlocked)")
     plk.set_defaults(fn=cmd_locked)
+    prg = sub.add_parser("regression", help="Tahoe AppleScript latency: sampled log, and is a macOS update out?")
+    prg.add_argument("--sample", action="store_true", help="take one measurement now")
+    prg.add_argument("--check-update", dest="check_update", action="store_true", help="ask softwareupdate (network)")
+    prg.set_defaults(fn=cmd_regression)
     ph = sub.add_parser("hub", help="how to restart the hub session without losing its Telegram channel")
     ph.set_defaults(fn=cmd_hub)
     ptg = sub.add_parser("tg-prune", help="delete Telegram inbox attachments older than N days (dry-run by default)")
