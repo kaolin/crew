@@ -247,6 +247,16 @@ def _clean(text):
     return out
 
 
+API_ERROR_RE = re.compile(r"API Error|\b5(?:29|0[0-9])\b|Overloaded|overloaded_error|rate.?limit", re.I)
+
+
+def api_error_ending(lines):
+    """True when the transcript's closing message is an API failure rather than a
+    report — the session went idle because the turn was dropped."""
+    tail = " ".join(t for _, t in (lines or [])[-3:])
+    return bool(API_ERROR_RE.search(tail))
+
+
 def last_gist(path, limit=GIST_CHARS):
     """The last substantive thing the session said, as one line. '' if unknown."""
     best = ""
@@ -960,7 +970,16 @@ def main():
                 tpath = transcript_path(s.get("cwd"), sid)
                 lines = last_gist(tpath)
                 shots = find_artifacts(tpath, p["busy_since"]) if SEND_PHOTOS else []
-                events.append(("✅", name, proj, f"finished after {mins:.0f}m", lines, shots))
+                if api_error_ending(lines):
+                    # busy→idle because the API dropped the turn, not because the
+                    # work finished. Saying "finished" here sent kaolin a ✅ whose
+                    # gist was "API Error: 529 Overloaded" (thereby-8e, 07:19
+                    # 2026-09-03) with his 02:25 list still half done.
+                    events.append(("⚠️", name, proj,
+                                   f"stopped after {mins:.0f}m on an API error — not finished, needs a retry",
+                                   lines, shots))
+                else:
+                    events.append(("✅", name, proj, f"finished after {mins:.0f}m", lines, shots))
             # STALLED: idle, and still owns open hubnotes. Fires ONCE and then
             # stays quiet until the session moves again — a repeating nag is one
             # you learn to ignore, which is the failure this rule exists to fix.
