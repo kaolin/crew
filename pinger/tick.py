@@ -992,6 +992,12 @@ def main():
                 # too, or it keeps counting across every turn that follows.
                 busy_since, notified = now, False
                 gist  = last_gist(tpath)
+                if sent_to_hub(tpath, since):
+                    # Same rule as the idle branch: a turn that handed its report
+                    # to the hub must not have its note-to-hub pasted at kaolin.
+                    # fusiontrainer's flowchart paths went out twice (19:18,
+                    # 2026-09-03) because only the idle branch checked.
+                    gist = [(False, "report delivered via the hub — see the hub's message")]
                 sig   = report_sig(gist)
                 prev_sig = p.get("last_sig")
                 quiet = (now - (p.get("last_sent") or 0)) >= SAME_REPORT_QUIET
@@ -1002,7 +1008,7 @@ def main():
                     seen, since = nlines, now
                     last_sig, last_sent = prev_sig, p.get("last_sent")
                 else:
-                    shots = find_artifacts(tpath, since) if SEND_PHOTOS else []
+                    shots = [] if sent_to_hub(tpath, since) else (find_artifacts(tpath, since) if SEND_PHOTOS else [])
                     if fold_bg_report(gist, shots, p.get("last_sent"), now):
                         # Parked on its own run, or a repeat within the cooldown:
                         # a pause, not a finish. Advance the markers and say
