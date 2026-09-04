@@ -2276,7 +2276,9 @@ def cmd_brief(a):
                       (n, dev.get("name", "?"), dev.get("shipped_commit", "?"), d.get("head", "?")))
             print("")
 
-        unpushed = [(n, d.get("unpushed")) for n, d in files if d.get("unpushed")]
+        # A session that writes `unpushed` as a string ("origin=github.com/…")
+        # was printed one character per item (spacetag, 2026-09-03).
+        unpushed = [(n, _listish(d, "unpushed")) for n, d in files if _listish(d, "unpushed")]
         if unpushed:
             print(C("36", "UNPUSHED WORK"))
             for n, u in unpushed:
