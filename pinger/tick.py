@@ -290,6 +290,22 @@ def api_error_ending(lines):
     return bool(API_ERROR_RE.search(tail))
 
 
+OWN_TASK_RE = re.compile(
+    r"(?i)\b(wait(ing|s)?|pick(ing)?\s+(it\s+|this\s+)?up|resum\w+|continu\w+)\b[^.\n]{0,80}?"
+    r"\b(completion notification|task[- ]notification|background (task|run|job|shell)|"
+    r"(when|once|until|after) (it|that|the \w+) (finishes|completes|lands|returns|is done|ends))")
+
+
+def waiting_on_own_task(lines):
+    """True when the closing message says the session is parked on its OWN
+    background task ("Waiting on the completion notification", "I'll pick up
+    when the run finishes"). The turn ended, but nothing finished: timeful
+    pinged ✅ three times in an hour (17:41, 17:58, 18:20 on 2026-09-03) while
+    re-running one load test, and kaolin was told each one was a finish."""
+    tail = " ".join(t for _, t in (lines or [])[-2:])
+    return bool(OWN_TASK_RE.search(tail))
+
+
 def last_gist(path, limit=GIST_CHARS):
     """The last substantive thing the session said, as one line. '' if unknown."""
     best = ""
@@ -962,9 +978,17 @@ def main():
                     last_sig, last_sent = prev_sig, p.get("last_sent")
                 else:
                     shots = find_artifacts(tpath, since) if SEND_PHOTOS else []
-                    events.append(("✅", name, proj,
-                                   f"finished after {(now - since) / 60:.0f}m (bg task still running)",
-                                   gist, shots))
+                    if waiting_on_own_task(gist):
+                        # The turn ended because the session is parked on its own
+                        # background run — a pause, not a finish. The real report
+                        # comes when that run lands and the next turn ends.
+                        events.append(("⏸", name, proj,
+                                       f"paused after {(now - since) / 60:.0f}m — waiting on its own background task, not finished",
+                                       gist, []))
+                    else:
+                        events.append(("✅", name, proj,
+                                       f"finished after {(now - since) / 60:.0f}m (bg task still running)",
+                                       gist, shots))
                     seen, since = nlines, now
                     last_sig, last_sent = sig, now
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
