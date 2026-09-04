@@ -50,6 +50,17 @@ check("'waiting' mid-sentence about kaolin", tick.waiting_on_own_task(g(
 check("empty", tick.waiting_on_own_task([]), False)
 check("None", tick.waiting_on_own_task(None), False)
 
+now = 1_000_000
+lines_parked = g("Everything hangs on this run. Waiting.")
+lines_plain = g("Lock screen captured. That's the frame. I'll compose the six from this single run once it finishes rather than mix sources.")
+lines_q = g("Lock screen captured. Keep the notification in the frame, or crop it?")
+check("parked → fold", tick.fold_bg_report(lines_parked, [], None, now), True)
+check("plain repeat 2 min after a send → fold", tick.fold_bg_report(lines_plain, [], now - 120, now), True)
+check("plain 31 min after a send → send", tick.fold_bg_report(lines_plain, [], now - 31 * 60, now), False)
+check("never sent → send", tick.fold_bg_report(lines_plain, [], None, now), False)
+check("with a photo → send even inside cooldown", tick.fold_bg_report(lines_plain, ["/x/a.png"], now - 120, now), False)
+check("a question → send even inside cooldown", tick.fold_bg_report(lines_q, [], now - 120, now), False)
+
 if fails:
     print("FAIL")
     for f in fails:

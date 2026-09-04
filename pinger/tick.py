@@ -301,6 +301,26 @@ OWN_TASK_RE = re.compile(
     r"|(^|[.!]\s+)Waiting(\s+on\s+(it|this|that))?\.?\s*$")
 
 
+BG_REPORT_COOLDOWN = 30 * 60   # a second bg-task "finished" within this is folded
+
+
+def fold_bg_report(lines, shots, last_sent, now):
+    """True when a bg-task turn-end should be folded rather than sent: the
+    session is parked on its own run, or it reported less than
+    BG_REPORT_COOLDOWN ago and this one carries no photo and asks nothing.
+    A session waiting on its own background task ends a turn at every wake
+    (its watcher fires, it looks, it waits again) — timeful ended five in 40
+    minutes on 2026-09-03 and each became a ✅ at kaolin."""
+    if waiting_on_own_task(lines):
+        return True
+    if shots:
+        return False
+    text = " ".join(t for _, t in (lines or [])).strip()
+    if text.endswith("?"):
+        return False
+    return (now - (last_sent or 0)) < BG_REPORT_COOLDOWN
+
+
 def waiting_on_own_task(lines):
     """True when the closing message says the session is parked on its OWN
     background task ("Waiting on the completion notification", "I'll pick up
@@ -983,19 +1003,18 @@ def main():
                     last_sig, last_sent = prev_sig, p.get("last_sent")
                 else:
                     shots = find_artifacts(tpath, since) if SEND_PHOTOS else []
-                    if waiting_on_own_task(gist):
-                        # The turn ended because the session is parked on its own
-                        # background run — a pause, not a finish. The real report
-                        # comes when that run lands and the next turn ends.
-                        events.append(("⏸", name, proj,
-                                       f"paused after {(now - since) / 60:.0f}m — waiting on its own background task, not finished",
-                                       gist, []))
+                    if fold_bg_report(gist, shots, p.get("last_sent"), now):
+                        # Parked on its own run, or a repeat within the cooldown:
+                        # a pause, not a finish. Advance the markers and say
+                        # nothing; the real report comes when the run lands.
+                        seen, since = nlines, now
+                        last_sig, last_sent = sig, p.get("last_sent")
                     else:
                         events.append(("✅", name, proj,
                                        f"finished after {(now - since) / 60:.0f}m (bg task still running)",
                                        gist, shots))
-                    seen, since = nlines, now
-                    last_sig, last_sent = sig, now
+                        seen, since = nlines, now
+                        last_sig, last_sent = sig, now
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
                         "stalled_sig": p.get("stalled_sig"),
                         "busy_since": busy_since, "notified_stuck": notified,
