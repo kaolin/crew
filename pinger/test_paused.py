@@ -40,6 +40,13 @@ check("waiting on kaolin is not own-task", tick.waiting_on_own_task(g(
     "Waiting on your call: promo text or a 1.3.3?")), False)
 check("only the last two lines count", tick.waiting_on_own_task(g(
     "Waiting on the completion notification.", "Run landed.", "All sixteen frames composed; paths below.")), False)
+check("timeful 18:18 (no 'notification' in it)", tick.waiting_on_own_task(g(
+    "Both watchers armed: one fires at the lock-screen capture (~7 min in), the other at run end. "
+    "Nothing else is independent — the commit, the six Android frames, and the hub report all hang on this run. Waiting.")), True)
+check("bare closing Waiting.", tick.waiting_on_own_task(g("Frames composed. Waiting.")), True)
+check("Waiting on you is not a pause", tick.waiting_on_own_task(g("Frames composed. Waiting on you.")), False)
+check("'waiting' mid-sentence about kaolin", tick.waiting_on_own_task(g(
+    "Still waiting on your answer about the promo text before I touch the listing.")), False)
 check("empty", tick.waiting_on_own_task([]), False)
 check("None", tick.waiting_on_own_task(None), False)
 

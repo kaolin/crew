@@ -291,9 +291,14 @@ def api_error_ending(lines):
 
 
 OWN_TASK_RE = re.compile(
-    r"(?i)\b(wait(ing|s)?|pick(ing)?\s+(it\s+|this\s+)?up|resum\w+|continu\w+)\b[^.\n]{0,80}?"
+    r"(?i)(\b(wait(ing|s)?|pick(ing)?\s+(it\s+|this\s+)?up|resum\w+|continu\w+)\b[^.\n]{0,80}?"
     r"\b(completion notification|task[- ]notification|background (task|run|job|shell)|"
-    r"(when|once|until|after) (it|that|the \w+) (finishes|completes|lands|returns|is done|ends))")
+    r"(when|once|until|after) (it|that|the \w+) (finishes|completes|lands|returns|is done|ends)))"
+    # "…all hang on this run. Waiting." / "watchers armed" — the same parking,
+    # said without the word "notification" (timeful 18:18, 2026-09-03).
+    r"|\b(hangs?|depends?|blocked|gated|waits?|waiting)\s+on\s+(this|that|the)\s+(run|build|sweep|test|install|job|capture)\b"
+    r"|\b(watchers?|monitors?)\s+(are\s+|is\s+)?armed\b"
+    r"|(^|[.!]\s+)Waiting(\s+on\s+(it|this|that))?\.?\s*$")
 
 
 def waiting_on_own_task(lines):
