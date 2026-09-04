@@ -1469,6 +1469,18 @@ def cmd_at_prompt(a):
     sys.exit(0 if ready else 1)
 
 
+def _one_line(msg):
+    """A typed prompt cannot contain newlines: each one is an Enter, so a
+    multi-line message lands as several prompts and drops characters at the
+    boundaries (orrery, 2026-09-04: "mber somewhere easy to see though").
+    Collapse them and say so."""
+    if "\n" not in msg:
+        return msg
+    flat = " ¶ ".join(p.strip() for p in msg.splitlines() if p.strip())
+    print("note: newlines collapsed to ' ¶ ' — a typed prompt submits on every line break")
+    return flat
+
+
 def cmd_tell(a):
     s, tty = _pick(a.name)
     if not s:
@@ -1479,7 +1491,7 @@ def cmd_tell(a):
         print(f"{s.get('name')} is busy (mid-turn). --force to send anyway (it'll queue).")
         return
     ad = adapter_for(tty)
-    ok = ad.tell(tty, a.message)
+    ok = ad.tell(tty, _one_line(a.message))
     print(f"→ sent to {s.get('name')} ({proj(s.get('cwd'))})" if ok
           else f"{s.get('name')} not reachable via {ad.name} (tty {tty})")
 
@@ -1496,7 +1508,7 @@ def cmd_ask(a):
         return
     ad = adapter_for(tty)
     before = _jsonl_lines(s)
-    if not ad.tell(tty, a.message):
+    if not ad.tell(tty, _one_line(a.message)):
         print(f"couldn't send to {s.get('name')} via {ad.name} (tty {tty})")
         return
     print(c("2", f"→ asked {s.get('name')}; waiting for the reply (Ctrl-C to stop)…"))
