@@ -250,6 +250,20 @@ def _clean(text):
 API_ERROR_RE = re.compile(r"API Error|\b5(?:29|0[0-9])\b|Overloaded|overloaded_error|rate.?limit", re.I)
 
 
+HUB_FOLD = "report delivered via the hub — see the hub's message"
+
+
+def fold_headline(headline, lines):
+    """A report that went to the hub keeps its label ("needs you" / "blocked")
+    but not the status-file text: kaolin had sandpainting's TESTFLIGHT REACH
+    question in full from the hub, then got it again, truncated, as
+    "needs you: TESTFLIGHT REACH: to get builds without… (+4 more)"
+    (2026-09-06 11:11). The label still says an answer is wanted."""
+    if not headline or not (len(lines) == 1 and lines[0][1] == HUB_FOLD):
+        return headline
+    return headline.split(":", 1)[0] + " — see the hub's message"
+
+
 def sent_to_hub(path, since_epoch, tail_lines=TAIL_LINES):
     """True when an assistant turn since `since_epoch` called SendMessage with the
     hub as recipient — the report went to the hub, not to the screen."""
@@ -997,7 +1011,7 @@ def main():
                     # to the hub must not have its note-to-hub pasted at kaolin.
                     # fusiontrainer's flowchart paths went out twice (19:18,
                     # 2026-09-03) because only the idle branch checked.
-                    gist = [(False, "report delivered via the hub — see the hub's message")]
+                    gist = [(False, HUB_FOLD)]
                 sig   = report_sig(gist)
                 prev_sig = p.get("last_sig")
                 quiet = (now - (p.get("last_sent") or 0)) >= SAME_REPORT_QUIET
@@ -1068,7 +1082,7 @@ def main():
                     # packet…"). The hub forwards the real report with the files;
                     # pasting the note-to-hub here gave kaolin the hub's version and
                     # then "the hub's version back to the agent" (2026-09-03 14:34).
-                    lines = [(False, "report delivered via the hub — see the hub's message")]
+                    lines = [(False, HUB_FOLD)]
                     shots = []
                 if api_error_ending(lines):
                     # busy→idle because the API dropped the turn, not because the
@@ -1137,7 +1151,7 @@ def main():
     seq = queue_next_seq()
     headlines = {}
     for kind, name, proj, extra, lines, ps in events:
-        h = status_headline(session_status(name))
+        h = fold_headline(status_headline(session_status(name)), lines)
         headlines[name] = h
         queue_event(seq, kind, name, proj, extra, h)
         seq += 1

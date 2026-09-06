@@ -56,6 +56,18 @@ os.unlink(t)
 
 check("missing transcript is False, not a crash", tick.sent_to_hub("/nope/nope.jsonl", now), False)
 
+fold = [(False, tick.HUB_FOLD)]
+normal = [(False, "Committed as 84bc8aa."), (False, "Build 47 is IN_BETA_TESTING.")]
+check("hub-delivered: keep the label, drop the re-paste",
+      tick.fold_headline("needs you: TESTFLIGHT REACH: accept the invite as… (+4 more)", fold),
+      "needs you — see the hub's message")
+check("hub-delivered 'blocked' keeps its label",
+      tick.fold_headline("blocked: waiting on ASC", fold), "blocked — see the hub's message")
+check("a normal report keeps its headline",
+      tick.fold_headline("needs you: pick 2x or print-grade", normal), "needs you: pick 2x or print-grade")
+check("empty headline stays empty", tick.fold_headline("", fold), "")
+check("fold line among others is not a fold", tick.fold_headline("needs you: X", fold + normal), "needs you: X")
+
 if fails:
     print("FAIL")
     for f in fails:
