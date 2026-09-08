@@ -253,6 +253,15 @@ API_ERROR_RE = re.compile(r"API Error|\b5(?:29|0[0-9])\b|Overloaded|overloaded_e
 HUB_FOLD = "report delivered via the hub — see the hub's message"
 
 
+def hub_delivered(lines, shots):
+    """True when the whole report is the hub fold and nothing else: the hub has
+    already sent kaolin the real thing, so a Telegram message saying only
+    "report delivered via the hub — see the hub's message" is noise. kaolin,
+    2026-09-08: "This stuff is unhelpful. Worth filtering when there's nothing
+    but 'sent to hub'." Still queued for the hub's brief; just not sent."""
+    return len(lines) == 1 and lines[0][1] == HUB_FOLD and not shots
+
+
 def fold_headline(headline, lines):
     """A report that went to the hub keeps its label ("needs you" / "blocked")
     but not the status-file text: kaolin had sandpainting's TESTFLIGHT REACH
@@ -1160,10 +1169,13 @@ def main():
         token, chats = load_token(), load_chats()
         stamp = time.strftime("%H:%M", time.localtime(now))
         nshots = 0
+        skipped = [n for _, n, _, _, l, ps in events if hub_delivered(l, ps)]
         for c in chats:
             # One message PER APP (not one batched "crew" blob), each self-headed
             # with source + a visible timestamp: "✅ babypaints-08 (BabyPaints) · 08:15 · finished…"
             for kind, name, proj, extra, lines, ps in events:
+                if hub_delivered(lines, ps):
+                    continue
                 hl = headlines.get(name) or ""
                 tail = f" · {hl}" if hl else ""
                 shown = display_name(name)
@@ -1178,8 +1190,9 @@ def main():
                 for p in ps:
                     send_photo(token, c, p, head_plain)
                     nshots += 1
-        log(f"sent {len(events)} per-app msg(s), {nshots} photo(s) to {len(chats)} chat(s): "
-            f"{[n for _, n, _, _, _, _ in events]}")
+        log(f"sent {len(events) - len(skipped)} per-app msg(s), {nshots} photo(s) to {len(chats)} chat(s): "
+            f"{[n for _, n, _, _, l, ps in events if not hub_delivered(l, ps)]}"
+            + (f"; hub-delivered, not sent: {skipped}" if skipped else ""))
     else:
         log(f"tick ok: {len(sessions)} sessions, {len(events)} event(s), "
             f"{'quiet' if in_quiet_hours(now) else 'no send'}"

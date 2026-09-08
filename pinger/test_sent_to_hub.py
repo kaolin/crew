@@ -68,6 +68,11 @@ check("a normal report keeps its headline",
 check("empty headline stays empty", tick.fold_headline("", fold), "")
 check("fold line among others is not a fold", tick.fold_headline("needs you: X", fold + normal), "needs you: X")
 
+check("hub-delivered report with no shots is not sent", tick.hub_delivered(fold, []), True)
+check("hub-delivered report WITH shots still goes (the photos are the point)", tick.hub_delivered(fold, ["/tmp/a.png"]), False)
+check("a normal report is sent", tick.hub_delivered(normal, []), False)
+check("fold line among others is sent", tick.hub_delivered(fold + normal, []), False)
+
 if fails:
     print("FAIL")
     for f in fails:
