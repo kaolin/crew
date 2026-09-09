@@ -2444,6 +2444,317 @@ def cmd_brief(a):
         os.replace(tmp, BRIEF_CURSOR)
 
 
+# --- status-refresh: a headless summarizer writes the status file ------------
+# Sessions are asked to write ~/.claude/status/<name>.json at the end of every
+# turn, and the ones that forget leave the hub reading week-old files (7 of 13
+# were over a day old on 2026-09-08). This runs `claude -p` (haiku, one call)
+# with hub/summarizer.md — previous status + git log + unpushed count + the
+# transcript tail — and asks for the SAME schema, so brief and the pinger keep
+# working. The file is also mirrored into <project>/.crew/status.json (excluded
+# via .git/info/exclude, never committed) so the project carries its own state.
+# Scheduling is OFF by default; README says how to turn it on and what it costs.
+REPO_DIR = os.path.dirname(os.path.realpath(globals().get("__file__") or sys.argv[0]))
+SUMMARIZER_PROMPT     = os.path.join(REPO_DIR, "hub", "summarizer.md")
+REFRESH_STATE         = os.path.join(SNAP_DIR, "status-refresh.json")   # {cwd: {last_run, name, changed}}
+REFRESH_COOLDOWN_SECS = 15 * 60
+REFRESH_MODEL         = "haiku"
+REFRESH_TAIL_LINES    = 200        # transcript lines fed to the summarizer
+REFRESH_TAIL_CHARS    = 60_000     # ...after rendering to USER/ASSISTANT turns
+REFRESH_TURN_CHARS    = 3_000      # per turn; a pasted build log is not status
+REFRESH_TIMEOUT_SECS  = 240
+REFRESH_EXCLUDE       = {"hub"}    # never summarize the hub, or anything rooted at $HOME
+
+
+def _status_name_for(s):
+    """Which ~/.claude/status/<name>.json a session owns. Existing files win:
+    `thereby-8e` → thereby.json, `[claude] erif_html` → erif.json (prefix).
+    A project with no file yet gets its directory name, lowercased."""
+    shown = (s.get("name") or "").replace("[claude] ", "", 1)
+    stem = re.sub(r"-[0-9a-z]{2}$", "", shown)
+    cands = [c for c in (stem, stem.lower(), proj(s.get("cwd")).lower(), proj(s.get("cwd"))) if c]
+    existing = [n for n, _ in _status_files()]
+    for c in cands:
+        if c in existing:
+            return c
+    for c in cands:
+        for n in existing:
+            if len(n) >= 4 and _slug(c).startswith(_slug(n)):
+                return n
+    return proj(s.get("cwd")).lower() or stem.lower() or "session"
+
+
+def _transcript_tail(s, lines=REFRESH_TAIL_LINES, chars=REFRESH_TAIL_CHARS):
+    """The last `lines` transcript records rendered as USER:/ASSISTANT: turns,
+    newest last, clipped per turn and in total (from the old end)."""
+    try:
+        with open(_jsonl_path(s), errors="ignore") as f:
+            raw = f.readlines()[-lines:]
+    except Exception:
+        return ""
+    out = []
+    for role, text in _parse_turns(raw):
+        t = text if len(text) <= REFRESH_TURN_CHARS else text[:REFRESH_TURN_CHARS] + " …[clipped]"
+        out.append("%s: %s" % (role.upper(), t))
+    text = "\n\n".join(out)
+    return text if len(text) <= chars else "…[older turns clipped]\n" + text[-chars:]
+
+
+def _git(cwd, *args, timeout=10):
+    try:
+        out = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=timeout,
+                             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    except Exception:
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def _git_facts(cwd):
+    """{repo, log, head, unpushed} for the summarizer. `unpushed` is an int, or
+    a sentence when there is no upstream or no repo."""
+    top = _git(cwd, "rev-parse", "--show-toplevel") if cwd and os.path.isdir(cwd) else None
+    if not top:
+        return {"repo": None, "log": "(not a git repo)", "head": None, "unpushed": "not a git repo"}
+    log = _git(top, "log", "--oneline", "-20") or "(no commits)"
+    head = _git(top, "rev-parse", "--short", "HEAD")
+    n = _git(top, "rev-list", "--count", "@{u}..HEAD")
+    unpushed = int(n) if (n or "").isdigit() else "no upstream configured (every commit is local-only)"
+    return {"repo": top, "log": log, "head": head, "unpushed": unpushed}
+
+
+def _build_prompt(session_label, cwd, prev, git, tail, now_iso):
+    tpl = io.open(SUMMARIZER_PROMPT, encoding="utf-8").read()
+    for k, v in (("SESSION", session_label), ("PROJECT", cwd or "?"), ("NOW", now_iso),
+                 ("PREVIOUS_STATUS", json.dumps(prev, indent=2, ensure_ascii=False) if prev else "{}"),
+                 ("GIT_LOG", git["log"]), ("UNPUSHED", str(git["unpushed"])),
+                 ("TRANSCRIPT_TAIL", tail or "(no transcript)")):
+        tpl = tpl.replace("{{%s}}" % k, v)
+    return tpl
+
+
+def _extract_json(text):
+    """The first {...} object in a model reply, fences or not. None if none parses."""
+    if not isinstance(text, str):
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t); t = re.sub(r"\s*```$", "", t)
+    a, b = t.find("{"), t.rfind("}")
+    if a < 0 or b <= a:
+        return None
+    try:
+        d = json.loads(t[a:b + 1])
+    except Exception:
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def _run_summarizer(prompt, cwd, model):
+    """One headless call. Returns (status_dict, meta, error). `--tools ""` and
+    `--max-turns 1`: it reads what it is given and answers; nothing runs."""
+    cmd = [_claude_bin(), "-p", "--model", model, "--output-format", "json",
+           "--tools", "", "--max-turns", "1", "--no-session-persistence"]
+    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")}
+    try:
+        out = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                             cwd=cwd if cwd and os.path.isdir(cwd) else None,
+                             timeout=REFRESH_TIMEOUT_SECS, env=env)
+    except subprocess.TimeoutExpired:
+        return None, {}, "claude -p timed out after %ds" % REFRESH_TIMEOUT_SECS
+    except OSError as e:
+        return None, {}, "could not run claude: %s" % e
+    if out.returncode != 0:
+        return None, {}, "claude -p exited %d: %s" % (out.returncode, (out.stderr or out.stdout).strip()[:300])
+    try:
+        env_ = json.loads(out.stdout)
+    except Exception:
+        return None, {}, "claude -p did not return JSON: %s" % out.stdout.strip()[:200]
+    if not isinstance(env_, dict):
+        return None, {}, "unexpected output shape"
+    meta = {"model": model, "session_id": env_.get("session_id"),
+            "cost_usd": env_.get("total_cost_usd"), "duration_ms": env_.get("duration_ms"),
+            "num_turns": env_.get("num_turns"), "usage": env_.get("usage")}
+    if env_.get("is_error"):
+        return None, meta, "claude -p reported an error: %s" % str(env_.get("result"))[:300]
+    d = _extract_json(env_.get("result"))
+    if d is None:
+        return None, meta, "no JSON object in the reply: %s" % str(env_.get("result"))[:200]
+    return d, meta, None
+
+
+def _comparable(d):
+    return {k: v for k, v in (d or {}).items() if k not in ("updated_at", "updated", "refreshed")}
+
+
+def _write_json_atomic(path, d):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def _mirror_status(repo, d):
+    """<repo>/.crew/status.json, with `.crew/` in .git/info/exclude — never
+    .gitignore (that is a change to their tree), never a commit. Returns the
+    mirror path, or None when the project is not a git repo."""
+    if not repo:
+        return None
+    excl = _git(repo, "rev-parse", "--git-path", "info/exclude")
+    if excl:
+        excl = excl if os.path.isabs(excl) else os.path.join(repo, excl)
+        try:
+            os.makedirs(os.path.dirname(excl), exist_ok=True)
+            lines = io.open(excl, encoding="utf-8").read().splitlines() if os.path.exists(excl) else []
+            if ".crew/" not in [l.strip() for l in lines]:
+                with io.open(excl, "a", encoding="utf-8") as f:
+                    f.write(("" if not lines or lines[-1] == "" else "\n") + ".crew/\n")
+        except OSError:
+            pass
+    path = os.path.join(repo, ".crew", "status.json")
+    _write_json_atomic(path, d)
+    return path
+
+
+def _load_refresh_state():
+    try:
+        return json.load(io.open(REFRESH_STATE, encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _stale_reason(name, d, recs, st):
+    """Why a session's status should be refreshed, or None. Fresh means either
+    the file or the last (possibly unchanged) refresh is recent, with no commit
+    after both."""
+    if not d:
+        return "no status file"
+    last_run = (st or {}).get("last_run") or 0
+    ages = [x for x in (_age_secs(d.get("updated_at") or d.get("updated")),
+                        (time.time() - last_run) if last_run else None) if x is not None]
+    eff_age = min(ages) if ages else None
+    latest, newer = _commits_since(name, d, recs)
+    if latest and last_run and (latest.get("t") or 0) <= last_run:
+        newer = 0                      # already summarized after that commit
+    if newer:
+        return "%d commit(s) after the status (latest %s)" % (newer, latest["sha"][:7])
+    if eff_age is None:
+        return "status has no readable updated_at"
+    if eff_age > STATUS_STALE_SECS:
+        return "status %s old" % _age(d.get("updated_at") or d.get("updated"))
+    return None
+
+
+def refresh_one(s, model=REFRESH_MODEL, dry_run=False, quiet=False):
+    """Summarize one session into its status file (+ mirror). Returns
+    'changed' | 'unchanged' | 'dry-run' | 'error'."""
+    cwd = s.get("cwd") or ""
+    name = _status_name_for(s)
+    path = os.path.join(STATUS_DIR, name + ".json")
+    try:
+        prev = json.load(io.open(path, encoding="utf-8"))
+    except Exception:
+        prev = {}
+    git = _git_facts(cwd)
+    tail = _transcript_tail(s)
+    now_iso = datetime.datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+    label = (s.get("name") or "").replace("[claude] ", "", 1) or name
+    prompt = _build_prompt(prev.get("session") or label, cwd, prev, git, tail, now_iso)
+    shown = s.get("name") or name
+    if dry_run:
+        print("%s → %s%s" % (shown, path, ("  (+ mirror in %s/.crew/)" % git["repo"]) if git["repo"] else "  (no git repo: no mirror)"))
+        print("   prompt %d chars: status %d, git log %d lines, unpushed %s, transcript %d chars; model %s — not sent"
+              % (len(prompt), len(json.dumps(prev)), len(git["log"].splitlines()), git["unpushed"], len(tail), model))
+        return "dry-run"
+    new, meta, err = _run_summarizer(prompt, cwd, model)
+    if err:
+        print("%s: %s" % (shown, err))
+        return "error"
+    # Identity and clock are ours, not the model's: the file must keep naming
+    # the session it always did (brief and the pinger key on it), and be dated
+    # by the run, not by whatever the model copied.
+    new["session"] = prev.get("session") or label
+    new["updated_at"] = now_iso
+    new.pop("updated", None)
+    if git["head"]:
+        new["head"] = git["head"]
+    new["refreshed"] = {"by": "crew status-refresh", "model": model, "at": now_iso,
+                        "cost_usd": meta.get("cost_usd"), "claude_session": meta.get("session_id")}
+    st = _load_refresh_state()
+    changed = [k for k in sorted(set(_comparable(new)) | set(_comparable(prev)))
+               if _comparable(new).get(k) != _comparable(prev).get(k)]
+    cost = ("$%.4f" % meta["cost_usd"]) if isinstance(meta.get("cost_usd"), (int, float)) else "cost n/a"
+    if not changed and prev:
+        st[cwd] = {"last_run": time.time(), "name": name, "changed": False}
+        _write_json_atomic(REFRESH_STATE, st)
+        print("%s: unchanged (%s, %s) — not rewritten" % (shown, model, cost))
+        return "unchanged"
+    _write_json_atomic(path, new)
+    mirror = _mirror_status(git["repo"], new)
+    st[cwd] = {"last_run": time.time(), "name": name, "changed": True}
+    _write_json_atomic(REFRESH_STATE, st)
+    print("%s → %s  (%s, %s)  changed: %s" % (shown, path, model, cost, ", ".join(changed)[:200] or "-"))
+    print("   mirror: %s" % mirror if mirror else "   no git repo: mirror skipped")
+    return "changed"
+
+
+def cmd_status_refresh(a):
+    if not os.path.exists(SUMMARIZER_PROMPT):
+        print("missing prompt %s" % SUMMARIZER_PROMPT); sys.exit(1)
+    try:
+        sessions = load(a.source)
+    except Exception as e:
+        print("could not list sessions: %s" % e); sys.exit(1)
+    fleet = [s for s in sessions
+             if (s.get("name") or "").replace("[claude] ", "", 1) not in REFRESH_EXCLUDE
+             and (s.get("cwd") or "").rstrip("/") != HOME.rstrip("/")
+             and s.get("status") not in ("completed", "stopped", "failed")]
+    if not a.target and not a.stale:
+        print("usage: crew status-refresh <name|all> | --stale   (add --dry-run to see the prompt size and targets)")
+        sys.exit(2)
+    if a.target == "all":
+        targets, cooldown = fleet, True
+    elif a.target == "--stale" or a.stale:
+        recs, st = _commit_records(), _load_refresh_state()
+        targets, cooldown = [], True
+        for s in fleet:
+            name = _status_name_for(s)
+            try:
+                d = json.load(io.open(os.path.join(STATUS_DIR, name + ".json"), encoding="utf-8"))
+            except Exception:
+                d = {}
+            why = _stale_reason(name, d, recs, st.get(s.get("cwd") or ""))
+            if why:
+                print("stale: %-18s %s" % (s.get("name"), why))
+                targets.append(s)
+        if not targets:
+            print("nothing stale — every status file is under a day old, refreshed recently, and has no commit after it")
+            return
+    else:
+        hit = _resolve(sessions, a.target)
+        if not hit:
+            print("no running session matches %r" % a.target); sys.exit(1)
+        if len(hit) > 1:
+            print("%r is ambiguous: %s" % (a.target, ", ".join(s.get("name") or "?" for s in hit))); sys.exit(1)
+        targets, cooldown = hit, False
+    st = _load_refresh_state()
+    results = {}
+    for s in targets:
+        last = (st.get(s.get("cwd") or "") or {}).get("last_run") or 0
+        if cooldown and (time.time() - last) < REFRESH_COOLDOWN_SECS and not a.dry_run:
+            print("%s: refreshed %s — cooling down (%d min)" % (
+                s.get("name"), _age(datetime.datetime.fromtimestamp(last).astimezone().isoformat()),
+                REFRESH_COOLDOWN_SECS // 60))
+            results["cooldown"] = results.get("cooldown", 0) + 1
+            continue
+        r = refresh_one(s, model=a.model, dry_run=a.dry_run)
+        results[r] = results.get(r, 0) + 1
+    if len(targets) > 1 or results.get("cooldown"):
+        print(", ".join("%d %s" % (n, k) for k, n in sorted(results.items())))
+    if results.get("error") and not results.get("changed") and not results.get("unchanged"):
+        sys.exit(1)
+
+
 # --- Claude Code hooks -------------------------------------------------------
 # The pinger infers "finished" and "needs you" from transcripts and a screen
 # scrape. Claude Code's own hooks state both as facts. `crew hooks install`
@@ -2771,6 +3082,17 @@ def main():
     pta = sub.add_parser("tg-actioned", help="mark Telegram inbound handled up through <seq> (or 'latest')")
     pta.add_argument("seq", help="a seq number, or 'latest' to mark everything logged as actioned")
     pta.set_defaults(fn=cmd_tg_actioned)
+    psr = sub.add_parser("status-refresh",
+        help="headless summarizer (claude -p, haiku) rewrites a session's status file + mirrors it into the repo")
+    psr.add_argument("target", nargs="?",
+        help="a session/project name, or 'all'; or pass --stale")
+    psr.add_argument("--stale", action="store_true",
+        help="only sessions whose status is over a day old or has a commit after it (15 min cooldown per project)")
+    psr.add_argument("--model", default=REFRESH_MODEL, help="model alias for claude -p (default %s)" % REFRESH_MODEL)
+    psr.add_argument("--dry-run", dest="dry_run", action="store_true",
+        help="build the prompt and say what would be written; call nothing")
+    psr.add_argument("--source", help="sessions JSON (testing)")
+    psr.set_defaults(fn=cmd_status_refresh)
     pcm = sub.add_parser("commits", help="commits the fleet has made (from the PostToolUse hook), newest first")
     pcm.add_argument("name", nargs="?", help="one session/project (resolves like every other command); omit for all")
     pcm.add_argument("--limit", type=int, default=20, help="rows to show (default 20)")

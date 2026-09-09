@@ -72,6 +72,7 @@ git clone https://github.com/kaolin/crew && crew/crew setup
 | `crew snapshot` · `crew restore` | save / rebuild the whole layout across a reboot |
 | `crew hooks install\|status\|uninstall` | Claude Code hooks that hand the pinger facts (needs-you / finished / commits); `install` prints the JSON and refuses without `--yes` |
 | `crew commits [name]` | every commit the fleet has made, newest first — which session, which repo, sha, subject (from the hook; no git hooks anywhere) |
+| `crew status-refresh <name\|all>` · `--stale` | headless `claude -p` (haiku) rewrites a session's `~/.claude/status/<name>.json` in the same schema and mirrors it to `<project>/.crew/status.json`; `--dry-run` shows the prompt size |
 | `crew setup` · `crew doctor` | install onto PATH + agent / health-check |
 
 `<name>` resolves by exact name, name-prefix, project, or substring.
@@ -109,6 +110,42 @@ heuristics for every session started before the hooks were installed — so the 
 migrates one restart at a time. `install` prints exactly what it would add and refuses
 without `--yes`: a global settings write once gated every session on this Mac.
 `uninstall --yes` removes only crew's entries; both leave a timestamped backup.
+
+## Status in the repo, and a summarizer for the sessions that forget (optional)
+
+Sessions are asked to write `~/.claude/status/<name>.json` at the end of every turn
+([docs/session-status.md](docs/session-status.md)); the ones that forget leave the hub
+reading week-old files. `crew status-refresh <name>` runs a headless `claude -p`
+(model `haiku`, `--tools ""`, one turn, no session saved) with
+[hub/summarizer.md](hub/summarizer.md) — the previous status, `git log --oneline -20`,
+the unpushed count, and the last ~200 transcript lines rendered as turns — and asks for
+the **same JSON schema**, so `crew brief` and the pinger keep working unchanged. `head`
+always comes from git, `updated_at` from the clock, and a `refreshed` block says which
+model wrote it and what it cost. The result is also mirrored to
+`<project>/.crew/status.json` with `.crew/` added to `<project>/.git/info/exclude`
+(never `.gitignore`, never a commit; projects that are not git repos get no mirror).
+
+`--stale` refreshes only sessions whose file is over a day old, missing, or has a
+recorded commit after it (`crew commits`), with a 15-minute cooldown per project and
+no rewrite when the summary comes back identical. The hub and anything rooted at `$HOME`
+are never summarized.
+
+**Scheduling is off by default.** Each refresh is one haiku call, billed to the Max plan
+like any other session; the first measured run (spacetag, a 20k-character prompt, 50 s)
+reported `total_cost_usd` 0.14 in its JSON envelope, so a fleet-wide `--stale` sweep is
+not free — `--stale` exists so only the files that need it cost a call. To turn it on,
+pick one:
+
+```sh
+# a) launchd, every 30 min — a second plist beside the pinger's
+crew status-refresh --stale            # as the ProgramArguments; only stale ones cost a call
+
+# b) one line at the end of pinger/tick.py's main(), inside a `if now % 1800 < 120` guard:
+#    subprocess.run([CREW_BIN, "status-refresh", "--stale"], timeout=600)
+```
+
+Either way, watch `~/.crew/status-refresh.json` (last run per project) and the
+`refreshed.cost_usd` field for a week before trusting it unattended.
 
 ## How it works
 

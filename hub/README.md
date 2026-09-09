@@ -18,3 +18,7 @@ Launched from `~/.crew/hub/` (a symlink here) so they survive the /private/tmp r
   the same hook on every Bash `git commit`). `crew brief` folds it in: the real HEAD behind a DEVICE STALE
   line, "+N commit(s) since this status" under UNPUSHED WORK, and a status file with commits after it
   is listed as stale. Verify a ship against these shas, not the session's claim.
+- `crew status-refresh <name>` / `--stale` — when `crew brief` lists STALE STATUS FILES and the session is
+  idle, this rewrites the file from its transcript with one headless haiku call (`summarizer.md` is the
+  prompt) instead of `crew tell`-ing the session to do it. Same schema, mirrored to `<project>/.crew/status.json`.
+  One call per refresh; `--dry-run` first if unsure. Nothing schedules it — see the README before you do.

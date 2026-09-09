@@ -363,6 +363,138 @@ PY
 ls "$hh/.claude/" | grep -q "settings.json.bak-" || fail "no backup written beside settings.json"
 rm -f "$hh"/.claude/settings.json*; rmdir "$hh/.claude" "$hh" 2>/dev/null || true
 
+echo "== status-refresh: fake claude -p, same schema, mirror + exclude, unchanged skip, --stale + cooldown =="
+sr=$(cd "$(mktemp -d)" && pwd -P)     # realpath: git reports the repo through /private/var, not /var
+mkdir -p "$sr/.claude/status" "$sr/.crew" "$sr/fake"
+# a project repo with two commits and an upstream so the unpushed count is a number
+mkdir -p "$sr/proj" "$sr/origin.git"
+git -C "$sr/origin.git" init -q --bare
+git -C "$sr/proj" init -q
+git -C "$sr/proj" -c user.name=t -c user.email=t@t commit -q --allow-empty -m "proj: first"
+git -C "$sr/proj" remote add origin "$sr/origin.git"
+git -C "$sr/proj" push -q -u origin HEAD 2>/dev/null
+git -C "$sr/proj" -c user.name=t -c user.email=t@t commit -q --allow-empty -m "proj: second, unpushed"
+head_sha=$(git -C "$sr/proj" rev-parse --short HEAD)
+# a session in that project, with a transcript
+sid="11111111-2222-3333-4444-555555555555"
+enc=$(python3 -c "import sys;print(sys.argv[1].replace('/','-'))" "$sr/proj")
+mkdir -p "$sr/.claude/projects/$enc"
+python3 - "$sr/.claude/projects/$enc/$sid.jsonl" <<'PY'
+import json, sys
+rows = [{"type": "user", "message": {"content": "ship build 12 to the moto"}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "Built 12, installed on the moto, 40 tests green. NEEDS YOU: pick the icon."}]}},
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}}]
+open(sys.argv[1], "w").write("\n".join(json.dumps(r) for r in rows) + "\n")
+PY
+cat > "$sr/sessions.json" <<EOF
+[{"pid":1,"cwd":"$sr/proj","kind":"interactive","startedAt":1,"sessionId":"$sid","name":"proj-ab","status":"idle"},
+ {"pid":2,"cwd":"$sr/plain","kind":"interactive","startedAt":1,"sessionId":"66666666-2222-3333-4444-555555555555","name":"plain-cd","status":"idle"},
+ {"pid":3,"cwd":"$HOME","kind":"interactive","startedAt":1,"sessionId":"77777777-2222-3333-4444-555555555555","name":"hub","status":"busy"}]
+EOF
+mkdir -p "$sr/plain"
+python3 -c "import json,sys,time; json.dump({'session':'proj-ab','updated_at':time.strftime('%Y-%m-%dT%H:%M:%S-0700'),'state':'working','settled':{'price':'\$1.99'},'needs_decision':[]}, open(sys.argv[1],'w'))" "$sr/.claude/status/proj.json"
+# the fake claude: records argv + the prompt it was fed, answers with a canned envelope
+cat > "$sr/fake/claude" <<'EOF'
+#!/bin/bash
+cat > "$FAKE_DIR/prompt.txt"
+printf '%s\n' "$@" > "$FAKE_DIR/argv.txt"
+echo called >> "$FAKE_DIR/calls.txt"
+cat "$FAKE_DIR/reply.json"
+EOF
+chmod +x "$sr/fake/claude"
+python3 - "$sr/fake/reply.json" <<'PY'
+import json, sys
+status = {"session": "proj-ab", "updated_at": "ignored", "state": "blocked", "head": "wrong",
+          "last_action": "Built 12, installed on the moto", "needs_decision": ["pick the icon"],
+          "settled": {"price": "$1.99"}, "verified": [], "unverified": ["installed on the moto"]}
+env = {"type": "result", "subtype": "success", "is_error": False, "result": "```json\n" + json.dumps(status) + "\n```",
+       "session_id": "fake-sess", "total_cost_usd": 0.0042, "duration_ms": 1200, "num_turns": 1,
+       "usage": {"input_tokens": 1500, "output_tokens": 200}}
+json.dump(env, open(sys.argv[1], "w"))
+PY
+export FAKE_DIR="$sr/fake"
+calls() { wc -l < "$sr/fake/calls.txt" | tr -d " "; }   # wc pads with spaces on macOS
+# dry-run: says what it would do, calls nothing
+d=$(CREW_HOME="$sr" CREW_CLAUDE="$sr/fake/claude" ./crew status-refresh proj --source "$sr/sessions.json" --dry-run)
+grep -q "proj.json" <<<"$d" || fail "dry-run didn't name the status file"
+grep -q "not sent" <<<"$d" || fail "dry-run should say it did not send"
+[[ -e "$sr/fake/calls.txt" ]] && fail "dry-run called claude"
+# the real thing (faked): prompt carries the four inputs; output lands in both places
+r=$(CREW_HOME="$sr" CREW_CLAUDE="$sr/fake/claude" ./crew status-refresh proj --source "$sr/sessions.json")
+echo "$r"
+grep -q "proj-ab → $sr/.claude/status/proj.json" <<<"$r" || fail "status-refresh didn't report the write"
+grep -q '\$0.0042' <<<"$r" || fail "status-refresh didn't report the cost"
+grep -q "mirror: $sr/proj/.crew/status.json" <<<"$r" || fail "status-refresh didn't mirror into the repo"
+grep -q -- "--model" "$sr/fake/argv.txt" && grep -q "^haiku$" "$sr/fake/argv.txt" || fail "claude -p not called with --model haiku"
+grep -q "^--output-format$" "$sr/fake/argv.txt" && grep -q "^json$" "$sr/fake/argv.txt" || fail "claude -p not called with --output-format json"
+grep -q "proj: second, unpushed" "$sr/fake/prompt.txt" || fail "prompt lacks the git log"
+grep -q "Unpushed: 1" "$sr/fake/prompt.txt" || fail "prompt lacks the unpushed count"
+grep -q '"price": "\$1.99"' "$sr/fake/prompt.txt" || fail "prompt lacks the previous status"
+grep -q "ASSISTANT: Built 12" "$sr/fake/prompt.txt" || fail "prompt lacks the transcript tail"
+grep -q "USER: ship build 12" "$sr/fake/prompt.txt" || fail "prompt lacks kaolin's turn"
+python3 - "$sr/.claude/status/proj.json" "$sr/proj/.crew/status.json" "$head_sha" <<'PY' || fail "written status wrong"
+import json, sys
+a, b = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+assert a == b, "mirror must equal the status file"
+assert a["session"] == "proj-ab" and a["state"] == "blocked" and a["needs_decision"] == ["pick the icon"], a
+assert a["head"] == sys.argv[3], ("head must come from git, not the model", a["head"])
+assert a["updated_at"] != "ignored" and a["updated_at"][:2] == "20", a["updated_at"]
+assert a["refreshed"]["by"] == "crew status-refresh" and a["refreshed"]["cost_usd"] == 0.0042
+print("  schema + head + mirror OK")
+PY
+grep -qx ".crew/" "$sr/proj/.git/info/exclude" || fail ".crew/ not added to .git/info/exclude"
+[[ -e "$sr/proj/.gitignore" ]] && fail "status-refresh must never touch .gitignore"
+git -C "$sr/proj" status --porcelain | grep -q "crew" && fail ".crew/ shows in git status (exclude not effective)"
+[[ $(git -C "$sr/proj" rev-list --count HEAD) == 2 ]] || fail "status-refresh must never commit"
+# second run, same reply: unchanged → not rewritten, exclude not duplicated, cooldown recorded
+m1=$(stat -f %m "$sr/.claude/status/proj.json")
+sleep 1
+r2=$(CREW_HOME="$sr" CREW_CLAUDE="$sr/fake/claude" ./crew status-refresh proj --source "$sr/sessions.json")
+grep -q "unchanged" <<<"$r2" || fail "identical summary should be reported unchanged"
+[[ $(stat -f %m "$sr/.claude/status/proj.json") == "$m1" ]] || fail "unchanged summary rewrote the file"
+[[ $(grep -c "^.crew/$" "$sr/proj/.git/info/exclude") == 1 ]] || fail ".crew/ duplicated in exclude"
+# --stale: proj is fresh (file + a refresh minutes ago); plain has no status file → exactly one call, for plain
+n=$(calls)
+s2=$(CREW_HOME="$sr" CREW_CLAUDE="$sr/fake/claude" ./crew status-refresh --stale --source "$sr/sessions.json")
+grep -q "stale: plain-cd .*no status file" <<<"$s2" || fail "--stale should pick a session with no status file"
+grep -q "stale: proj-ab" <<<"$s2" && fail "--stale picked a fresh status"
+grep -q "hub" <<<"$s2" && fail "--stale must never summarize the hub"
+[[ $(calls) == $((n + 1)) ]] || fail "--stale should have called exactly once (plain)"
+# the non-git project: status written, mirror skipped, nothing created in its tree
+[[ -e "$sr/.claude/status/plain.json" ]] || fail "non-git project status not written"
+[[ -e "$sr/plain/.crew" ]] && fail "non-git project must not get a .crew/ mirror"
+grep -q "no git repo: mirror skipped" <<<"$s2" || fail "non-git mirror skip not reported"
+CREW_HOME="$sr" CREW_CLAUDE="$sr/fake/claude" ./crew status-refresh --stale --source "$sr/sessions.json" | grep -q "nothing stale" || fail "--stale should now find nothing"
+[[ $(calls) == $((n + 1)) ]] || fail "--stale called claude with nothing stale"
+# a commit after the status makes proj stale; but the 15-min cooldown holds until the state is cleared
+python3 - "$sr/.claude/status/_commits.jsonl" "$sr/proj" <<'PY'
+import json, sys, time
+t = time.time() + 2
+open(sys.argv[1], "w").write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t)), "t": t,
+    "session_id": "11111111-2222-3333-4444-555555555555", "cwd": sys.argv[2], "repo": sys.argv[2],
+    "project": "proj", "branch": "main", "sha": "abc1234def", "subject": "proj: third"}) + "\n")
+PY
+s3=$(CREW_HOME="$sr" CREW_CLAUDE="$sr/fake/claude" ./crew status-refresh --stale --source "$sr/sessions.json")
+grep -q "stale: proj-ab .*1 commit(s) after the status" <<<"$s3" || fail "--stale didn't see the commit after the status"
+grep -q "cooling down" <<<"$s3" || fail "--stale ignored the 15-min cooldown"
+[[ $(calls) == $((n + 1)) ]] || fail "cooldown did not stop the call"
+rm -f "$sr/.crew/status-refresh.json"
+s4=$(CREW_HOME="$sr" CREW_CLAUDE="$sr/fake/claude" ./crew status-refresh --stale --source "$sr/sessions.json")
+grep -q "stale: proj-ab" <<<"$s4" || fail "--stale (no cooldown) didn't pick proj"
+grep -q "plain-cd" <<<"$s4" && fail "plain's fresh status must not be re-summarized"
+[[ $(calls) == $((n + 2)) ]] || fail "--stale should have called once, for proj"
+# a broken reply leaves the file alone and exits non-zero
+cp "$sr/.claude/status/proj.json" "$sr/proj.before"
+echo 'not json at all' > "$sr/fake/reply.json"
+CREW_HOME="$sr" CREW_CLAUDE="$sr/fake/claude" ./crew status-refresh proj --source "$sr/sessions.json" >/dev/null && fail "garbage reply should exit non-zero"
+cmp -s "$sr/proj.before" "$sr/.claude/status/proj.json" || fail "garbage reply changed the status file"
+# unknown name
+un=$(CREW_HOME="$sr" CREW_CLAUDE="$sr/fake/claude" ./crew status-refresh nonesuch --source "$sr/sessions.json" || true)
+grep -q "no running session" <<<"$un" || fail "unknown target should say so"
+un=$(CREW_HOME="$sr" CREW_CLAUDE="$sr/fake/claude" ./crew status-refresh --source "$sr/sessions.json" || true)
+grep -q "usage:" <<<"$un" || fail "no target should print usage"
+unset FAKE_DIR
+
 echo "== pinger suites =="
 # These lived beside tick.py and had to be remembered individually, so a broken
 # one could sit green-by-omission. Globbed instead of listed: a new test_*.py
