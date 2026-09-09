@@ -10,7 +10,11 @@ diffing against the previous snapshot in state.json:
                 (catches hung / blocked sessions). Alerts once per episode.
 
 There is no "blocked/waiting" flag in `claude agents --json` (only idle/busy),
-so these two transitions are the honest signals available.
+so these two transitions are the honest signals available — plus, for sessions
+started after `crew hooks install --yes`, Claude Code's own Stop and
+Notification hooks (~/.claude/status/_hooks.jsonl), which state "turn ended"
+and "prompt is up" as facts. Those are preferred where they exist; the
+transcript heuristics stay for every session that predates them.
 
 Sends one batched message per tick to every paired Telegram chat, straight
 through the bot API — independent of the hub session.
@@ -571,6 +575,106 @@ def status_headline(st):
     return ""
 
 
+# --- Claude Code hook events ---------------------------------------------------
+# hooks/crew-hook.py (installed by `crew hooks install --yes`) appends one line
+# per Notification / Stop / PostToolUse(Bash) here. A session that has ANY hook
+# events gets its "finished" and "needs you" from those facts: a Stop IS the turn
+# boundary, so no transcript line-count or screen scrape (which cannot see a
+# locked Mac) is needed; a permission Notification IS the prompt being up.
+# Sessions started before the hooks were installed have no events and keep the
+# transcript heuristics below. Neither path is removed — the fleet restarts one
+# session at a time, and the heuristics are the only eyes on the rest.
+HOOKS_LOG        = f"{STATUS_DIR}/_hooks.jsonl"
+HOOKS_TAIL_BYTES = 4 * 1024 * 1024     # PostToolUse(Bash) is chatty; the tail is all a tick needs
+# Notification types that mean a PERSON has to act. idle_prompt is the opposite
+# (nobody typed for a minute) and must not read as blocked; a record with no
+# type at all is taken as needs-input, since the message is the only clue.
+NEEDS_INPUT_TYPES = {"permission_prompt", "elicitation_dialog", "elicitation_url_dialog",
+                     "agent_needs_input"}
+
+
+def hook_events(path=HOOKS_LOG, max_bytes=HOOKS_TAIL_BYTES):
+    """{session_id: [event, ...]}, oldest first, from the tail of the hook log.
+    {} when the log does not exist (hooks not installed) or cannot be read —
+    every session then falls back to the heuristics, exactly as before."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return {}
+    if size > max_bytes and lines:
+        lines = lines[1:]                  # the cut may have landed mid-record
+    out = {}
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            e = json.loads(ln)
+        except ValueError:
+            continue
+        sid = e.get("session_id") if isinstance(e, dict) else None
+        if sid:
+            out.setdefault(sid, []).append(e)
+    return out
+
+
+def hook_verdict(events, seen=0):
+    """What the hook log says about one session. Returns (stop, notify, cursor):
+
+    stop    the newest Stop with t > `seen` — a turn ended since we last looked;
+            None if none did.
+    notify  the newest needs-input Notification that no Stop has followed — the
+            prompt it describes is still up. Independent of `seen`: a prompt
+            stays up until answered, however long ago it went up.
+    cursor  the newest t of any event; store it as the next tick's `seen`.
+    """
+    stop = notify = None
+    last_stop_t = 0.0
+    cursor = float(seen or 0)
+    for e in events or []:
+        try:
+            t = float(e.get("t") or 0)
+        except (TypeError, ValueError):
+            continue
+        cursor = max(cursor, t)
+        kind = e.get("hook_event_name")
+        if kind == "Stop":
+            last_stop_t = max(last_stop_t, t)
+            if t > float(seen or 0) and (stop is None or t > float(stop.get("t") or 0)):
+                stop = e
+        elif kind == "Notification":
+            ntype = e.get("notification_type")
+            if ntype and ntype not in NEEDS_INPUT_TYPES:
+                continue
+            if notify is None or t > float(notify.get("t") or 0):
+                notify = e
+    if notify is not None and float(notify.get("t") or 0) <= last_stop_t:
+        notify = None
+    return stop, notify, cursor
+
+
+def hook_pending(notify, pend):
+    """Merge the hook's word with the transcript's, hook first.
+
+    The hook is the FACT that a prompt is up; the transcript — when the tool_use
+    was logged before the prompt went up, which it often is not — has the
+    question text and options kaolin needs on his phone. So the transcript's
+    question wins on content, the hook wins on existence, and a hook with no
+    transcript detail still says permission-vs-question from its message."""
+    if not notify:
+        return pend
+    msg = " ".join(str(notify.get("message") or notify.get("title") or "").split())
+    if pend and pend[0] == "question":
+        return pend
+    if "AskUserQuestion" in msg:
+        return ("question", pend[1] if pend and pend[1] else msg)
+    return ("permission", pend[1] if pend and pend[1] else (msg or "permission prompt"))
+
+
 def queue_event(seq, kind, name, proj, extra, headline):
     """Append one event to the durable queue. Best-effort by design."""
     try:
@@ -964,12 +1068,22 @@ def main():
     # per-session record and re-announced the same 11 notes (autostereogram,
     # 08:35 2026-09-03 — "Didn't we do this all already?").
     stalled_by_app = state.setdefault("stalled_by_app", {})
+    hooks = hook_events()          # {} until `crew hooks install --yes` and a restart
 
     events, new = [], {}
     for s in sessions:
         sid, name, status = s["sessionId"], s["name"], s["status"]
         proj = os.path.basename(s.get("cwd", "")) or "?"
         p = prev.get(sid, {})
+
+        # Hook facts for this session, if it has any. `hv is None` means the
+        # heuristics carry it. The first time hooks appear for a session that
+        # is already in state, count only Stops after its last report — the
+        # log's tail may hold hours of older ones that were already news.
+        hv = hooks.get(sid)
+        hook_since = p.get("hook_seen") or p.get("last_report") or now
+        stop_ev, notify_ev, hook_seen = (hook_verdict(hv, hook_since) if hv is not None
+                                         else (None, None, p.get("hook_seen") or 0))
 
         if status == "busy":
             busy_since = p.get("busy_since") if p.get("status") == "busy" and p.get("busy_since") else now
@@ -1004,11 +1118,13 @@ def main():
                 seen, since = nlines, now
             elif (NOTIFY_FINISHED and not first_run
                     and name not in EXCLUDE_NAMES
-                    and nlines > seen
                     and (now - since) >= MIN_FINISHED_SECS
-                    # Screen check last: it shells out, so only pay for it once
-                    # we already know there is something new to report.
-                    and at_prompt_via_crew(name)):
+                    # Hooks first: a Stop since the last look IS the turn
+                    # boundary. Without hooks, new transcript output plus an
+                    # empty prompt on screen — the screen check last, since it
+                    # shells out and only matters once there is something new.
+                    and (stop_ev is not None if hv is not None
+                         else (nlines > seen and at_prompt_via_crew(name)))):
                 # Getting here means the screen check passed, so the turn is
                 # over and only a background shell keeps the status busy. That
                 # is the same boundary the stuck timer needs — restart it here
@@ -1049,18 +1165,24 @@ def main():
                         "busy_since": busy_since, "notified_stuck": notified,
                         "reported_lines": seen, "last_report": since,
                         "last_sig": locals().get("last_sig", p.get("last_sig")),
-                        "last_sent": locals().get("last_sent", p.get("last_sent"))}
+                        "last_sent": locals().get("last_sent", p.get("last_sent")),
+                        "hook_seen": hook_seen}
         elif status == "waiting":
             # NOT finished — it's blocked ON KAOLIN and will sit there forever.
             # This used to fall through to the idle branch and get reported as
             # "✅ finished", which is how orrery lost 1h40m (kaolin, 2026-07-31).
             tpath = transcript_path(s.get("cwd"), sid)
             pend = pending_prompt(tpath) if NOTIFY_WAITING else None
+            if hv is not None:
+                # The Notification hook saw the prompt go up; the transcript
+                # may not have logged the tool_use yet. Hook first, transcript
+                # for the wording.
+                pend = hook_pending(notify_ev, pend)
             notified = bool(p.get("notified_waiting"))
             if (NOTIFY_WAITING and not notified and not first_run
                     and name not in EXCLUDE_NAMES):
                 detail = pend[1] if pend else ""
-                extra = pending_via_crew(name)      # sees screen-only prompts
+                extra = pending_via_crew(name) if not detail else []   # sees screen-only prompts
                 if not detail and extra:
                     detail = "\n".join(extra)
                     if any(k in detail for k in ("Enter to select", "1.")):
@@ -1075,12 +1197,18 @@ def main():
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
                         "stalled_sig": p.get("stalled_sig"),
                         "busy_since": p.get("busy_since"), "notified_stuck": False,
-                        "notified_waiting": notified}
+                        "notified_waiting": notified,
+                        "hook_seen": hook_seen}
         else:  # idle
-            if (NOTIFY_FINISHED and not first_run
-                    and name not in EXCLUDE_NAMES
-                    and p.get("status") == "busy" and p.get("busy_since")
-                    and (now - p["busy_since"]) >= MIN_FINISHED_SECS):
+            finished = (p.get("status") == "busy" and bool(p.get("busy_since"))
+                        and (now - (p.get("busy_since") or now)) >= MIN_FINISHED_SECS)
+            if finished and hv is not None and stop_ev is None:
+                # With hooks, "finished" is a Stop. A busy->idle flip without
+                # one is an interrupted turn (Esc) or a turn the busy branch
+                # already reported off its Stop — either way, not news.
+                log(f"{name}: busy->idle with no Stop hook since last report; not reporting")
+                finished = False
+            if NOTIFY_FINISHED and not first_run and name not in EXCLUDE_NAMES and finished:
                 mins = (now - p["busy_since"]) / 60
                 tpath = transcript_path(s.get("cwd"), sid)
                 lines = last_gist(tpath)
@@ -1147,7 +1275,8 @@ def main():
                         # everything it already sent from the idle edge
                         "reported_lines": transcript_lines(
                             transcript_path(s.get("cwd"), sid)),
-                        "last_report": now}
+                        "last_report": now,
+                        "hook_seen": hook_seen}
 
     save_state({"initialized": True, "updated": now, "sessions": new,
                 "stalled_by_app": stalled_by_app,

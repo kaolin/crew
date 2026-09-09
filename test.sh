@@ -288,6 +288,48 @@ CREW_HOME="$th" ./crew brief --plain | grep -q "you have not seen" && fail "acke
 CREW_HOME="$th" ./crew tg-patch >/dev/null 2>&1 || fail "tg-patch errored with no plugin dir"
 rm -rf "$th"
 
+echo "== hooks: install prints the JSON and refuses without --yes; --yes is idempotent; uninstall is surgical =="
+hh=$(mktemp -d)
+mkdir -p "$hh/.claude"
+echo '{"model":"x","hooks":{"Stop":[{"hooks":[{"type":"command","command":"/other/thing.sh"}]}]}}' > "$hh/.claude/settings.json"
+hi=$(CREW_HOME="$hh" ./crew hooks install; echo "rc=$?")
+grep -q '"matcher": "Bash"'          <<<"$hi" || fail "hooks install didn't print the PostToolUse Bash entry"
+grep -q '"Notification"'             <<<"$hi" || fail "hooks install didn't print the Notification entry"
+grep -q '"Stop"'                     <<<"$hi" || fail "hooks install didn't print the Stop entry"
+grep -q '"command": "/'              <<<"$hi" || fail "hook command is not an absolute path"
+grep -q 'hooks/crew-hook.py'         <<<"$hi" || fail "hook command doesn't point at hooks/crew-hook.py"
+grep -q 'rc=2'                       <<<"$hi" || fail "hooks install without --yes must refuse (exit 2)"
+grep -q 'crew-hook' "$hh/.claude/settings.json" && fail "hooks install without --yes wrote settings.json"
+CREW_HOME="$hh" ./crew hooks status | grep -q "not installed" || fail "hooks status should say not installed"
+CREW_HOME="$hh" ./crew hooks install --yes >/dev/null || fail "hooks install --yes failed"
+python3 - "$hh/.claude/settings.json" <<'PY' || fail "merged settings wrong"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["model"] == "x", "other keys must survive"
+assert d["hooks"]["Stop"][0]["hooks"][0]["command"] == "/other/thing.sh", "existing Stop hook must survive"
+assert len(d["hooks"]["Stop"]) == 2, d["hooks"]["Stop"]
+assert d["hooks"]["PostToolUse"][0]["matcher"] == "Bash"
+assert "matcher" not in d["hooks"]["Notification"][0], "Notification takes no matcher (match all)"
+cmds = {h["command"] for ev in ("Notification", "Stop", "PostToolUse") for g in d["hooks"][ev] for h in g["hooks"]}
+assert any(c.endswith("/hooks/crew-hook.py") and c.startswith("/") for c in cmds), cmds
+assert all(h.get("timeout") for ev in ("Notification", "PostToolUse") for g in d["hooks"][ev] for h in g["hooks"])
+print("  merge OK")
+PY
+before=$(cat "$hh/.claude/settings.json")
+CREW_HOME="$hh" ./crew hooks install --yes | grep -q "nothing to do" || fail "second install should be a no-op"
+[[ "$(cat "$hh/.claude/settings.json")" == "$before" ]] || fail "second install changed settings.json"
+CREW_HOME="$hh" ./crew hooks status | grep -q "PostToolUse   installed" || fail "hooks status should say installed"
+CREW_HOME="$hh" ./crew hooks uninstall >/dev/null && fail "uninstall without --yes must refuse"
+CREW_HOME="$hh" ./crew hooks uninstall --yes >/dev/null || fail "uninstall --yes failed"
+python3 - "$hh/.claude/settings.json" <<'PY' || fail "uninstall left the wrong thing behind"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["hooks"] == {"Stop": [{"hooks": [{"type": "command", "command": "/other/thing.sh"}]}]}, d["hooks"]
+print("  uninstall OK")
+PY
+ls "$hh/.claude/" | grep -q "settings.json.bak-" || fail "no backup written beside settings.json"
+rm -f "$hh"/.claude/settings.json*; rmdir "$hh/.claude" "$hh" 2>/dev/null || true
+
 echo "== pinger suites =="
 # These lived beside tick.py and had to be remembered individually, so a broken
 # one could sit green-by-omission. Globbed instead of listed: a new test_*.py

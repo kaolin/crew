@@ -2316,6 +2316,163 @@ def cmd_brief(a):
         os.replace(tmp, BRIEF_CURSOR)
 
 
+# --- Claude Code hooks -------------------------------------------------------
+# The pinger infers "finished" and "needs you" from transcripts and a screen
+# scrape. Claude Code's own hooks state both as facts. `crew hooks install`
+# merges three entries into ~/.claude/settings.json that run hooks/crew-hook.py
+# (append-only, exit 0, silent) — see pinger/tick.py "hook events" for how they
+# are preferred. A global settings write once gated every session on this Mac,
+# so install prints exactly what it would add and refuses without --yes.
+SETTINGS_PATH = os.path.join(HOME, ".claude", "settings.json")
+HOOK_TIMEOUT_SECS = 5      # the handler takes ~30 ms; git attribution ~150 ms
+
+
+def _hook_script():
+    """Absolute path to the handler beside this script (through any symlink)."""
+    here = os.path.dirname(os.path.realpath(globals().get("__file__") or sys.argv[0]))
+    return os.path.join(here, "hooks", "crew-hook.py")
+
+
+def hook_entries(script=None):
+    """The `hooks` block install merges. Notification and Stop take no matcher
+    (Stop has none; Notification's would filter by type, and the pinger does
+    that itself); PostToolUse is limited to Bash, the only tool whose command
+    can be a `git commit`."""
+    cmd = script or _hook_script()
+    one = {"type": "command", "command": cmd, "timeout": HOOK_TIMEOUT_SECS}
+    return {
+        "Notification": [{"hooks": [dict(one)]}],
+        "Stop":         [{"hooks": [dict(one)]}],
+        "PostToolUse":  [{"matcher": "Bash", "hooks": [dict(one)]}],
+    }
+
+
+def _hook_present(settings, event, group, cmd):
+    """Is a command hook for `cmd` already in settings under `event` with the
+    same matcher? Idempotence key: (event, matcher, command)."""
+    for g in (settings.get("hooks") or {}).get(event) or []:
+        if not isinstance(g, dict) or (g.get("matcher") or "") != (group.get("matcher") or ""):
+            continue
+        for h in g.get("hooks") or []:
+            if isinstance(h, dict) and h.get("type") == "command" and h.get("command") == cmd:
+                return True
+    return False
+
+
+def merge_hooks(settings, entries, cmd):
+    """Return (new_settings, added) — settings with any missing crew entries
+    appended. Existing hooks of any kind are left exactly as they were."""
+    out = json.loads(json.dumps(settings))
+    hooks = out.setdefault("hooks", {})
+    added = []
+    for event, groups in entries.items():
+        for g in groups:
+            if _hook_present(out, event, g, cmd):
+                continue
+            hooks.setdefault(event, []).append(g)
+            added.append(event)
+    return out, added
+
+
+def unmerge_hooks(settings, cmd):
+    """Return (new_settings, removed) — crew's command hooks taken out, empty
+    groups/events/`hooks` pruned, everything else untouched."""
+    out = json.loads(json.dumps(settings))
+    removed = []
+    hooks = out.get("hooks") or {}
+    for event in list(hooks):
+        kept = []
+        for g in hooks[event] or []:
+            if not isinstance(g, dict):
+                kept.append(g); continue
+            hs = [h for h in (g.get("hooks") or [])
+                  if not (isinstance(h, dict) and h.get("type") == "command" and h.get("command") == cmd)]
+            if len(hs) != len(g.get("hooks") or []):
+                removed.append(event)
+            if hs:
+                kept.append({**g, "hooks": hs})
+        if kept:
+            hooks[event] = kept
+        else:
+            del hooks[event]
+    if not hooks and "hooks" in out:
+        del out["hooks"]
+    return out, removed
+
+
+def _read_settings():
+    try:
+        return json.load(io.open(SETTINGS_PATH, encoding="utf-8"))
+    except OSError:
+        return {}
+
+
+def _write_settings(d):
+    """Atomic, with a timestamped backup beside it. This file gates every session."""
+    os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+    if os.path.exists(SETTINGS_PATH):
+        bak = SETTINGS_PATH + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
+        n = 1
+        while os.path.exists(bak):          # two writes in one second keep both backups
+            n += 1
+            bak = SETTINGS_PATH + ".bak-" + time.strftime("%Y%m%d-%H%M%S") + "-%d" % n
+        shutil.copy2(SETTINGS_PATH, bak)
+    tmp = SETTINGS_PATH + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, SETTINGS_PATH)
+
+
+def cmd_hooks(a):
+    cmd = _hook_script()
+    entries = hook_entries(cmd)
+    settings = _read_settings()
+    if a.action == "status":
+        ok = os.path.isfile(cmd) and os.access(cmd, os.X_OK)
+        print("handler  %s  %s" % (cmd, "ok" if ok else "MISSING or not executable"))
+        print("settings %s" % SETTINGS_PATH)
+        for event, groups in entries.items():
+            present = all(_hook_present(settings, event, g, cmd) for g in groups)
+            print("  %-13s %s" % (event, "installed" if present else "not installed"))
+        log = os.path.join(STATUS_DIR, "_hooks.jsonl")
+        try:
+            n = sum(1 for _ in io.open(log, encoding="utf-8", errors="replace"))
+            print("log      %s  %d event(s)" % (log, n))
+        except OSError:
+            print("log      %s  (none yet — sessions started before install write nothing)" % log)
+        return
+    if a.action == "install":
+        merged, added = merge_hooks(settings, entries, cmd)
+        print("would add to %s:" % SETTINGS_PATH)
+        print(json.dumps({"hooks": {e: g for e, g in entries.items() if e in added}} if added else {}, indent=2))
+        if not added:
+            print("nothing to do — all three are already installed")
+            return
+        if not a.yes:
+            print("refusing: this edits a global settings file that every session reads. "
+                  "Review the JSON above, then re-run with --yes.")
+            sys.exit(2)
+        if not (os.path.isfile(cmd) and os.access(cmd, os.X_OK)):
+            print("refusing: handler %s is missing or not executable" % cmd)
+            sys.exit(1)
+        _write_settings(merged)
+        print("installed %s (backup beside it). Running sessions pick hooks up when Claude Code "
+              "notices the file change; otherwise on their next restart." % ", ".join(added))
+        return
+    if a.action == "uninstall":
+        pruned, removed = unmerge_hooks(settings, cmd)
+        if not removed:
+            print("nothing to remove — no crew hooks in %s" % SETTINGS_PATH)
+            return
+        print("would remove crew's hooks from %s: %s" % (SETTINGS_PATH, ", ".join(removed)))
+        if not a.yes:
+            print("refusing without --yes")
+            sys.exit(2)
+        _write_settings(pruned)
+        print("removed %s (backup beside it)" % ", ".join(removed))
+
+
 def cmd_tg_patch(a):
     """Check -- and with --apply, restore -- the local telegram server.ts patch."""
     versions = _tg_plugin_versions()
@@ -2486,6 +2643,12 @@ def main():
     pta = sub.add_parser("tg-actioned", help="mark Telegram inbound handled up through <seq> (or 'latest')")
     pta.add_argument("seq", help="a seq number, or 'latest' to mark everything logged as actioned")
     pta.set_defaults(fn=cmd_tg_actioned)
+    phk = sub.add_parser("hooks",
+        help="Claude Code hooks that feed the pinger facts (Notification, Stop, PostToolUse Bash)")
+    phk.add_argument("action", choices=["install", "status", "uninstall"])
+    phk.add_argument("--yes", action="store_true",
+        help="actually write ~/.claude/settings.json (install/uninstall print the change and refuse without it)")
+    phk.set_defaults(fn=cmd_hooks)
     a = ap.parse_args()
     a.fn(a)
 

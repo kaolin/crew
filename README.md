@@ -70,6 +70,7 @@ git clone https://github.com/kaolin/crew && crew/crew setup
 | `crew jump <name>` | go to where its window *actually* is (+ front it) |
 | `crew goto <name>` · `crew where <name>` | go to its *tagged* Space · show actual vs. tagged |
 | `crew snapshot` · `crew restore` | save / rebuild the whole layout across a reboot |
+| `crew hooks install\|status\|uninstall` | Claude Code hooks that hand the pinger facts (needs-you / finished / commits); `install` prints the JSON and refuses without `--yes` |
 | `crew setup` · `crew doctor` | install onto PATH + agent / health-check |
 
 `<name>` resolves by exact name, name-prefix, project, or substring.
@@ -88,10 +89,30 @@ difference — a live spinner and "esc to interrupt" mean a turn is running; the
 with an input box means it'll take your message right now — and marks those
 `⟵ at prompt (bg task)` instead of letting them look hung.
 
+## Hooks: facts instead of regexes (optional)
+
+Everything above is inferred — transcript line counts, a tool_use with no tool_result,
+a scrape of the terminal that cannot see a locked Mac. Claude Code's own hooks state
+the same things as facts. `crew hooks install --yes` merges three entries into
+`~/.claude/settings.json`, all running `hooks/crew-hook.py` (stdlib, append-only,
+exits 0, never prints, ~30 ms):
+
+| event | what gets logged | who reads it |
+|---|---|---|
+| `Notification` | `notification_type`, `message` → `~/.claude/status/_hooks.jsonl` | pinger: **needs you** |
+| `Stop` | the turn ended → `_hooks.jsonl` | pinger: **finished** |
+| `PostToolUse` (Bash) | the command; a `git commit` also writes `{session, cwd, branch, sha, subject}` → `_commits.jsonl` | `crew commits`, `crew brief` |
+
+The pinger prefers hook events for any session that has any, and keeps the transcript
+heuristics for every session started before the hooks were installed — so the fleet
+migrates one restart at a time. `install` prints exactly what it would add and refuses
+without `--yes`: a global settings write once gated every session on this Mac.
+`uninstall --yes` removes only crew's entries; both leave a timestamped backup.
+
 ## How it works
 
 - **Awareness** — `claude agents --json` reports every running session, interactive ones
-  included, with cwd / sessionId / name / live status. No hooks, no wrapper process.
+  included, with cwd / sessionId / name / live status. No wrapper process; hooks optional.
 - **Dispatch & jump** — resolve a session, join `pid → tty → the live iTerm2 session`,
   and act in place via AppleScript.
 - **Reboot map** — a launchd agent snapshots the fleet every 5 min into
