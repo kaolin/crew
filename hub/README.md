@@ -14,3 +14,7 @@ Launched from `~/.crew/hub/` (a symlink here) so they survive the /private/tmp r
   every session on this Mac, so this is the hub's call, after kaolin has seen the JSON. `crew hooks status`
   shows what is installed and how many events the log holds; sessions started before the install keep
   the pinger's transcript heuristics until they restart.
+- `crew commits [name]` — which session made which commit (`~/.claude/status/_commits.jsonl`, written by
+  the same hook on every Bash `git commit`). `crew brief` folds it in: the real HEAD behind a DEVICE STALE
+  line, "+N commit(s) since this status" under UNPUSHED WORK, and a status file with commits after it
+  is listed as stale. Verify a ship against these shas, not the session's claim.

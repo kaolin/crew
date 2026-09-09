@@ -2224,6 +2224,111 @@ def _pinger_events(since):
     return out, mx
 
 
+# --- commit attribution ------------------------------------------------------
+# hooks/crew-hook.py appends one record per `git commit` a session runs:
+# {ts, t, session_id, cwd, repo, project, branch, sha, subject}. Read here,
+# never written by crew, and no git hook in any repo — the Claude Code
+# PostToolUse hook is the only writer, so a commit kaolin makes by hand in a
+# terminal is not in it, and a status file is only as current as the newest
+# record says it is.
+COMMITS_LOG = os.path.join(HOME, ".claude", "status", "_commits.jsonl")
+
+
+def _commit_records():
+    """Every commit record, oldest first. [] when nothing has been recorded."""
+    out = []
+    try:
+        for ln in io.open(COMMITS_LOG, encoding="utf-8", errors="replace"):
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                r = json.loads(ln)
+            except Exception:
+                continue
+            if isinstance(r, dict) and r.get("sha"):
+                out.append(r)
+    except OSError:
+        pass
+    return out
+
+
+def _slug(s):
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
+def _commits_for(name, d, recs):
+    """Commit records that belong to a status file: the record's repo is the
+    status's project (spacetag.json <-> ~/dev/spacetag; erif.json <-> erif_html
+    by prefix), or its session id is the one the status names. Slugged so
+    BabyPaints/babypaints and erif_html/erif-html meet."""
+    sess = str(d.get("session") or "")
+    keys = {_slug(name), _slug(re.sub(r"-[0-9a-z]{2}$", "", sess)), _slug(sess)}
+    keys.discard("")
+    out = []
+    for r in recs:
+        if sess and r.get("session_id") == sess:
+            out.append(r)
+            continue
+        cands = {_slug(r.get("project")), _slug(os.path.basename((r.get("cwd") or "").rstrip("/")))}
+        cands.discard("")
+        if cands & keys or any(c.startswith(k) for c in cands for k in keys if len(k) >= 4):
+            out.append(r)
+    return out
+
+
+def _commits_since(name, d, recs):
+    """(latest record, how many are newer than the status file). A commit after
+    `updated_at` is work the file does not describe — the exact measure of
+    "how far behind is this status", where the 24 h rule is only a guess."""
+    mine = _commits_for(name, d, recs)
+    if not mine:
+        return None, 0
+    latest = max(mine, key=lambda r: r.get("t") or 0)
+    age = _age_secs(d.get("updated_at") or d.get("updated"))
+    if age is None:
+        return latest, 0
+    cutoff = time.time() - age
+    return latest, sum(1 for r in mine if (r.get("t") or 0) > cutoff)
+
+
+def cmd_commits(a):
+    """Every commit the fleet has made, newest first — who, where, what."""
+    recs = _commit_records()
+    if not recs:
+        print("no commits recorded in %s" % COMMITS_LOG)
+        print("(needs `crew hooks install --yes`; sessions record from their next restart)")
+        return
+    try:
+        sessions = load(a.source)
+    except Exception:
+        sessions = []
+    if a.name:
+        hit = _resolve(sessions, a.name) if sessions else []
+        if hit:
+            ids = {s.get("sessionId") for s in hit}
+            cwds = {(s.get("cwd") or "").rstrip("/") for s in hit}
+            recs = [r for r in recs if r.get("session_id") in ids
+                    or (r.get("repo") or "").rstrip("/") in cwds
+                    or (r.get("cwd") or "").rstrip("/") in cwds]
+        else:
+            k = a.name.lower()   # not running any more: match the record itself
+            recs = [r for r in recs if k in " ".join(
+                str(r.get(f) or "") for f in ("project", "repo", "session_id", "branch")).lower()]
+        if not recs:
+            print("no recorded commits match %r" % a.name)
+            return
+    names = {s.get("sessionId"): s.get("name") for s in sessions}
+    recs = list(reversed(recs))
+    if not a.all:
+        recs = recs[:a.limit]
+    for r in recs:
+        who = names.get(r.get("session_id")) or (r.get("session_id") or "?")[:8]
+        print("%-9s %-14s %s %-12s %-18s %s" % (
+            _age(r.get("ts")), (r.get("project") or "?")[:14], (r.get("sha") or "")[:7],
+            (r.get("branch") or "")[:12], who[:18], r.get("subject") or ""))
+
+
 def cmd_brief(a):
     """Wake briefing: what every session last said, and what the pinger saw."""
     C = (lambda code, t: t) if a.plain else (lambda code, t: "\033[%sm%s\033[0m" % (code, t))
@@ -2278,33 +2383,56 @@ def cmd_brief(a):
                 print("  %-16s %-9s %s" % (name, _age(d.get("updated_at")), str(line)[:100]))
             print("")
 
+        # Commit records (hooks/crew-hook.py) are exact where the status file is
+        # the session's own claim: the real HEAD behind a stale device, and how
+        # many commits landed after the file was written.
+        recs = _commit_records()
+
         stale = [(n, d) for n, d in files
                  if isinstance(d.get("device"), dict) and d["device"].get("stale")]
         if stale:
             print(C("31;1", "DEVICE STALE — kaolin may be testing code that no longer exists"))
             for n, d in stale:
                 dev = d["device"]
+                head = str(d.get("head", "?"))
+                latest, _ = _commits_since(n, d, recs)
+                if latest and not head.startswith(latest["sha"][:7]):
+                    head += " (latest commit %s · %s)" % (latest["sha"][:7], _age(latest.get("ts")))
                 print("  %-16s %s: shipped %s vs head %s" %
-                      (n, dev.get("name", "?"), dev.get("shipped_commit", "?"), d.get("head", "?")))
+                      (n, dev.get("name", "?"), dev.get("shipped_commit", "?"), head))
             print("")
 
         # A session that writes `unpushed` as a string ("origin=github.com/…")
         # was printed one character per item (spacetag, 2026-09-03).
-        unpushed = [(n, _listish(d, "unpushed")) for n, d in files if _listish(d, "unpushed")]
+        unpushed = [(n, d, _listish(d, "unpushed")) for n, d in files if _listish(d, "unpushed")]
         if unpushed:
             print(C("36", "UNPUSHED WORK"))
-            for n, u in unpushed:
+            for n, d, u in unpushed:
                 print("  %-16s %s" % (n, ", ".join(str(x) for x in u)[:100]))
+                latest, newer = _commits_since(n, d, recs)
+                if newer:
+                    print("  %-16s +%d commit(s) since this status, latest %s %s" %
+                          ("", newer, latest["sha"][:7], str(latest.get("subject") or "")[:60]))
             print("")
 
         # Everything above is only as true as the file is recent. A status file
-        # nobody has touched in a day describes a session that has since done a
-        # day's work — read it as history, and `crew peek` the session for now.
-        old = [(n, _age(d.get("updated_at"))) for n, d in files
-               if _age_secs(d.get("updated_at")) is not None
-               and _age_secs(d.get("updated_at")) > STATUS_STALE_SECS]
+        # nobody has touched in a day — or that commits have landed after —
+        # describes a session that has since done work it does not mention:
+        # read it as history, and `crew peek` the session (or
+        # `crew status-refresh --stale`) for now.
+        old = []
+        for n, d in files:
+            secs = _age_secs(d.get("updated_at"))
+            latest, newer = _commits_since(n, d, recs)
+            if secs is not None and secs > STATUS_STALE_SECS:
+                old.append((n, _age(d.get("updated_at"))
+                            + (" · %d commit(s) after it" % newer if newer else "")))
+            elif newer:
+                old.append((n, "%d commit(s) after it, latest %s · %s" %
+                            (newer, latest["sha"][:7], _age(latest.get("ts")))))
         if old:
-            print(C("33;1", "STALE STATUS FILES — %d (older than a day; peek the session instead)" % len(old)))
+            print(C("33;1", "STALE STATUS FILES — %d (older than a day, or commits since; "
+                            "peek the session instead)" % len(old)))
             for n, ag in old:
                 print("  %-16s %s" % (n, ag))
             print("")
@@ -2643,6 +2771,12 @@ def main():
     pta = sub.add_parser("tg-actioned", help="mark Telegram inbound handled up through <seq> (or 'latest')")
     pta.add_argument("seq", help="a seq number, or 'latest' to mark everything logged as actioned")
     pta.set_defaults(fn=cmd_tg_actioned)
+    pcm = sub.add_parser("commits", help="commits the fleet has made (from the PostToolUse hook), newest first")
+    pcm.add_argument("name", nargs="?", help="one session/project (resolves like every other command); omit for all")
+    pcm.add_argument("--limit", type=int, default=20, help="rows to show (default 20)")
+    pcm.add_argument("--all", action="store_true", help="every record")
+    pcm.add_argument("--source", help="sessions JSON (testing)")
+    pcm.set_defaults(fn=cmd_commits)
     phk = sub.add_parser("hooks",
         help="Claude Code hooks that feed the pinger facts (Notification, Stop, PostToolUse Bash)")
     phk.add_argument("action", choices=["install", "status", "uninstall"])

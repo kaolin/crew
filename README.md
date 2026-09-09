@@ -71,6 +71,7 @@ git clone https://github.com/kaolin/crew && crew/crew setup
 | `crew goto <name>` · `crew where <name>` | go to its *tagged* Space · show actual vs. tagged |
 | `crew snapshot` · `crew restore` | save / rebuild the whole layout across a reboot |
 | `crew hooks install\|status\|uninstall` | Claude Code hooks that hand the pinger facts (needs-you / finished / commits); `install` prints the JSON and refuses without `--yes` |
+| `crew commits [name]` | every commit the fleet has made, newest first — which session, which repo, sha, subject (from the hook; no git hooks anywhere) |
 | `crew setup` · `crew doctor` | install onto PATH + agent / health-check |
 
 `<name>` resolves by exact name, name-prefix, project, or substring.

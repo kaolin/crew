@@ -272,14 +272,47 @@ import json, sys, time, os
 th = sys.argv[1]
 now = time.strftime("%Y-%m-%dT%H:%M:%S-0700")
 old = time.strftime("%Y-%m-%dT%H:%M:%S-0700", time.localtime(time.time() - 3*86400))
+two_h = time.strftime("%Y-%m-%dT%H:%M:%S-0700", time.localtime(time.time() - 2*3600))
 json.dump({"updated_at": now, "needs_decision": ["ship it?"]}, open(os.path.join(th, ".claude/status/izzit.json"), "w"))
 json.dump({"updated_at": old, "summary": "old news"}, open(os.path.join(th, ".claude/status/orrery.json"), "w"))
+# thereby: status 2h old, a device shipped at aaa1111 vs head bbb2222 (stale), one commit AFTER the status
+json.dump({"session": "thereby-8e", "updated_at": two_h, "head": "bbb2222", "unpushed": ["139"],
+           "device": {"name": "Grayhame", "shipped_commit": "aaa1111", "stale": True}},
+          open(os.path.join(th, ".claude/status/thereby.json"), "w"))
+t = time.time()
+with open(os.path.join(th, ".claude/status/_commits.jsonl"), "w") as f:
+    # izzit's commit belongs to the fixture's izzit-2b session (by id); its status is newer than it
+    f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t - 4*3600)), "t": t - 4*3600,
+                        "session_id": "ff10d5a8-b98c-4cf5-8323-68b28e06a778", "cwd": "/Users/kaolin/dev/izzit",
+                        "repo": "/Users/kaolin/dev/izzit", "project": "izzit", "branch": "main",
+                        "sha": "c0ffee1234567890", "subject": "izzit: packs"}) + "\n")
+    f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t - 600)), "t": t - 600,
+                        "session_id": "153722a7-422d-49e4-9e9a-a40c90453f00", "cwd": "/Users/kaolin/dev/thereby",
+                        "repo": "/Users/kaolin/dev/thereby", "project": "thereby", "branch": "main",
+                        "sha": "ccc3333abcdef", "subject": "recording on by default for testers"}) + "\n")
+    f.write("garbage line\n")
 PY
 b=$(CREW_HOME="$th" ./crew brief --plain --no-ack)
 grep -q "1 event(s) you have not seen" <<<"$b" || fail "brief didn't show the unseen pinger event"
 grep -q "NEEDS KAOLIN"                 <<<"$b" || fail "brief didn't surface needs_decision"
 grep -q "STALE STATUS FILES"           <<<"$b" || fail "brief didn't flag the 3-day-old status file"
 grep -q "orrery"                       <<<"$b" || fail "stale block should name orrery"
+# commit attribution feeding brief: exact head behind the stale device, commits since the status
+grep -q "shipped aaa1111 vs head bbb2222 (latest commit ccc3333" <<<"$b" || fail "DEVICE STALE didn't use the commit record's sha"
+grep -q "+1 commit(s) since this status, latest ccc3333"       <<<"$b" || fail "UNPUSHED WORK didn't count the commit after the status"
+grep -qE "thereby +1 commit\(s\) after it, latest ccc3333"     <<<"$b" || fail "STALE block didn't flag the status with a commit after it"
+grep -q "izzit .*commit(s) after it"                            <<<"$b" && fail "a commit OLDER than the status must not count"
+# crew commits: resolves a name the way every other command does; lists newest first
+cc=$(CREW_HOME="$th" ./crew commits --source fixture.json)
+[[ $(head -1 <<<"$cc") == *ccc3333* ]] || fail "crew commits should list newest first"
+grep -q "c0ffee1 .*izzit-2b .*izzit: packs" <<<"$cc" || fail "crew commits didn't name the session that made the commit"
+CREW_HOME="$th" ./crew commits izzit --source fixture.json | grep -q "c0ffee1" || fail "crew commits <name> didn't resolve izzit"
+CREW_HOME="$th" ./crew commits izzit --source fixture.json | grep -q "ccc3333" && fail "crew commits izzit showed thereby's commit"
+CREW_HOME="$th" ./crew commits thereby --source fixture.json | grep -q "ccc3333" || fail "a project with no live session should still match by record"
+CREW_HOME="$th" ./crew commits nonesuch --source fixture.json | grep -q "no recorded commits match" || fail "unknown name should say so"
+CREW_HOME="$th" ./crew commits --source fixture.json --limit 1 | wc -l | grep -q "^ *1$" || fail "--limit not honoured"
+mkdir -p "$th/empty/.claude/status"
+CREW_HOME="$th/empty" ./crew commits | grep -q "no commits recorded" || fail "no log should say so, not crash"
 [[ -e "$th/.claude/status/_brief.cursor" ]] && fail "--no-ack must not write the brief cursor"
 CREW_HOME="$th" ./crew brief --plain >/dev/null
 [[ $(cat "$th/.claude/status/_brief.cursor") == 1 ]] || fail "brief without --no-ack should ack to seq 1"
