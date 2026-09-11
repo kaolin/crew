@@ -187,7 +187,7 @@ def build():
             if not val:
                 continue
             segs.append(
-                f'<i class="seg" style="height:{100 * val / tok_top:.3f}%;'
+                f'<i class="seg" data-l="{esc(proj)}" style="height:{100 * val / tok_top:.3f}%;'
                 f'background:var(--p{slot[proj]})" title="{esc(proj)}: {val:,}"></i>')
         seg_rows.append(
             f'<div class="bar" title="{k[:10]} {k[11:13]}:00 — {v:,} output tokens, {t} turns">'
