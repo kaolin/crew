@@ -54,6 +54,12 @@ NOTIFY_STALLED    = True       # the opposite blind spot: a session sitting IDLE
 STALLED_MINS      = 30.0       # idle this long WITH open notes -> ping once
 HUBNOTES_LEDGER   = f"{HOME}/.claude/status/_hubnotes.jsonl"
 EXCLUDE_NAMES     = {"hub"}     # sessions to never ping about (the hub itself)
+# Sessions whose permission prompts an approver script answers (the hub keeps
+# this list). A "blocked on a permission prompt" for one of these is not news
+# for kaolin: Chrome consent asks on every browser step, and each one used to
+# page his phone (14 messages in 25 minutes on 2026-09-11 — "seems like I'm
+# getting some spam of responses?"). Questions ("needs your answer") still go.
+APPROVER_COVERED_FILE = os.path.expanduser("~/.crew/hub/approver-covered.txt")
 QUIET_HOURS       = None       # e.g. (23, 8) to mute 23:00-08:00 local; None = off
 TUNNEL_STALL_SECS = 120        # inbound queued-but-undelivered longer than this -> tunnel is down
 POLLER_DOWN_SECS  = 180        # bot poller process dead this long -> whole bridge down (rides out a brief restart)
@@ -255,6 +261,15 @@ API_ERROR_RE = re.compile(r"API Error|\b5(?:29|0[0-9])\b|Overloaded|overloaded_e
 
 
 HUB_FOLD = "report delivered via the hub — see the hub's message"
+
+
+def approver_covered():
+    """Session names whose permission prompts an approver answers; empty if unset."""
+    try:
+        with open(APPROVER_COVERED_FILE) as f:
+            return {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
+    except OSError:
+        return set()
 
 
 def hub_delivered(lines, shots):
@@ -1191,8 +1206,11 @@ def main():
                     glyph, what = "🙋", "needs your answer"
                 else:
                     glyph, what = "🔐", "blocked on a permission prompt"
-                body = _clean(detail) if detail else [(False, "run: crew pending")]
-                events.append((glyph, name, proj, what, body, []))
+                if glyph == "🔐" and name in approver_covered():
+                    log(f"{name}: permission prompt, approver-covered; not paging")
+                else:
+                    body = _clean(detail) if detail else [(False, "run: crew pending")]
+                    events.append((glyph, name, proj, what, body, []))
                 notified = True
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
                         "stalled_sig": p.get("stalled_sig"),

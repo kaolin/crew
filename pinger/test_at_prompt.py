@@ -137,3 +137,17 @@ monster = "x" * 5000
 mparts = chunks_of(monster)
 check("monster line still split", len(mparts) > 1, True)
 check("monster line intact", "".join(mparts), monster)
+
+# --- approver-covered sessions: a permission prompt is not news (2026-09-11) ---
+import tempfile
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tick
+_tmp = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+_tmp.write("# comment\nbabypaints-ba\n[claude] timeful\n\n"); _tmp.close()
+_saved = tick.APPROVER_COVERED_FILE
+tick.APPROVER_COVERED_FILE = _tmp.name
+check("approver-covered reads names", tick.approver_covered(), {"babypaints-ba", "[claude] timeful"})
+tick.APPROVER_COVERED_FILE = "/nonexistent/approver-covered.txt"
+check("approver-covered missing file is empty", tick.approver_covered(), set())
+tick.APPROVER_COVERED_FILE = _saved
+os.unlink(_tmp.name)
