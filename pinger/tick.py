@@ -1206,7 +1206,11 @@ def main():
                     glyph, what = "🙋", "needs your answer"
                 else:
                     glyph, what = "🔐", "blocked on a permission prompt"
-                if glyph == "🔐" and name in approver_covered():
+                # A Claude-in-Chrome consent lists numbered options, so the
+                # heuristic above files it as a "question"; it is still a
+                # permission prompt the approver answers.
+                chrome_consent = "Claude in Chrome wants to" in (detail or "")
+                if name in approver_covered() and (glyph == "🔐" or chrome_consent):
                     log(f"{name}: permission prompt, approver-covered; not paging")
                 else:
                     body = _clean(detail) if detail else [(False, "run: crew pending")]
