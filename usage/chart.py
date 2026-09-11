@@ -122,12 +122,18 @@ def rail(stamps):
     fixed strides would drift.
     """
     cells, prev_day, prev_bucket = [], None, None
+    # Label only every k-th day boundary once the span is long: at a month of
+    # 15-minute samples every day-label overlaps its neighbour and nothing reads.
+    ndays = len({d for d, _ in stamps})
+    step = max(1, -(-ndays // 8))
+    day_index = -1
     for d, h in stamps:
         bucket = h // 4
         if d != prev_day:
+            day_index += 1
             # Weekday first: the shape of this data is a work-week pattern, and
             # "Sat" answers "why is that stretch quiet?" faster than a date does.
-            label = datetime.date.fromisoformat(d).strftime("%a %-d %b")
+            label = datetime.date.fromisoformat(d).strftime("%a %-d %b") if day_index % step == 0 else ""
             cells.append(f'<div class="t day" data-label="{label}"></div>')
         elif bucket != prev_bucket:
             cells.append('<div class="t micro"></div>')
@@ -189,7 +195,7 @@ def build():
     tok_bars = "".join(seg_rows)
     tok_axis = yaxis(tok_top, 4, human)
     tok_legend = "".join(
-        f'<span class="key"><i style="background:var(--p{i})"></i>{esc(p)}'
+        f'<span class="key" data-l="{esc(p)}"><i style="background:var(--p{i})"></i>{esc(p)}'
         f' <b>{human(totals[p]) if p != "other" else human(sum(totals[q] for q in rest))}</b></span>'
         for i, p in enumerate(order))
 
@@ -393,6 +399,17 @@ td.num,th.num{{text-align:right;white-space:nowrap}}
 .key{{display:inline-flex;align-items:center;gap:5px}}
 .key i{{width:9px;height:9px;border-radius:2px;display:inline-block}}
 .key b{{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}}
+.key{{cursor:pointer;padding:2px 6px;margin:-2px -6px;border-radius:5px;
+  transition:background .12s,opacity .12s}}
+.key:hover,.key.on{{background:var(--idle)}}
+.legend.iso .key:not(.on){{opacity:.38}}
+.bars.iso .seg{{display:none}}
+.bars.iso .seg.on{{display:block;border-radius:2px 2px 0 0;border-bottom:none}}
+.key.hi{{background:var(--idle);box-shadow:inset 0 0 0 1.5px var(--faint)}}
+.key.hi b{{color:var(--ink)}}
+.legend.dim .key:not(.hi){{opacity:.35}}
+.bars.dim .seg:not(.hi){{opacity:.22}}
+.isonote{{min-height:1.2em;margin:6px 0 0;font-size:11.5px;color:var(--dim)}}
 .rail{{display:flex;gap:0;width:max-content;height:21px}}
 .rail{{margin-left:52px}}
   .rail .t{{flex:0 0 var(--bw);position:relative;border-right:1px solid transparent}}
@@ -438,7 +455,8 @@ td.num,th.num{{text-align:right;white-space:nowrap}}
     <div class="plotbody"><div class="bars grid">{tok_bars}</div></div>
   </div>
   <div class="rail">{tok_rail}</div>
-  <div class="legend">{tok_legend}</div></div>
+  <div class="legend" id="lg">{tok_legend}</div>
+  <p class="isonote" id="iso">&nbsp;</p></div>
   <div class="axis"><span>{span}</span><span>peak {peak} tok/h</span></div>
 </section>
 
@@ -498,6 +516,81 @@ an hour is not you: it's the crew-pinger heartbeat, a machine baseline that neve
 stops. Sampling began 2026-08-13 08:16; nothing before that can be recovered,
 because the endpoint keeps no history.</p>
 </div>
+<script>
+(function(){{
+  var lg=document.getElementById('lg'), bars=document.querySelector('.bars'),
+      note=document.getElementById('iso');
+  if(!lg||!bars) return;
+  var keys=[].slice.call(lg.querySelectorAll('.key'));
+  var segs=[].slice.call(bars.querySelectorAll('.seg'));
+  var pinned=null;
+  function totalFor(l){{
+    var n=0;
+    segs.forEach(function(s){{
+      if(s.getAttribute('data-l')!==l) return;
+      var m=(s.getAttribute('title')||'').match(/([\d,]+)$/);
+      if(m) n+=parseInt(m[1].replace(/,/g,''),10);
+    }});
+    return n;
+  }}
+  function show(l){{
+    if(!l){{
+      bars.classList.remove('iso'); lg.classList.remove('iso');
+      keys.forEach(function(k){{k.classList.remove('on')}});
+      segs.forEach(function(s){{s.classList.remove('on')}});
+      note.innerHTML='&nbsp;'; return;
+    }}
+    bars.classList.add('iso'); lg.classList.add('iso');
+    keys.forEach(function(k){{k.classList.toggle('on',k.getAttribute('data-l')===l)}});
+    var hrs=0;
+    segs.forEach(function(s){{
+      var hit=s.getAttribute('data-l')===l;
+      s.classList.toggle('on',hit); if(hit) hrs++;
+    }});
+    note.innerHTML=l+' only &mdash; <b>'+totalFor(l).toLocaleString()+
+      '</b> output tokens across <b>'+hrs+'</b> hours. Same y-axis.';
+  }}
+  // hovering a segment tells you which project it is
+  var hiOn=false;
+  function hi(l,detail){{
+    hiOn = !!l;
+    keys.forEach(function(k){{k.classList.toggle('hi',k.getAttribute('data-l')===l)}});
+    lg.classList.toggle('dim',!!l);
+    bars.classList.toggle('dim',!!l);
+    segs.forEach(function(s){{s.classList.toggle('hi',s.getAttribute('data-l')===l)}});
+    note.innerHTML = l ? detail : '&nbsp;';
+  }}
+  segs.forEach(function(s){{
+    s.addEventListener('mouseenter',function(){{
+      if(pinned||bars.classList.contains('iso')) return;
+      var l=s.getAttribute('data-l');
+      var bar=s.parentNode, when=(bar.getAttribute('title')||'').split(' — ')[0];
+      var v=(s.getAttribute('title')||'').split(': ')[1]||'';
+      hi(l,'<b>'+l+'</b> &middot; '+v+' output tokens &middot; '+when);
+    }});
+  }});
+  bars.addEventListener('mouseleave',function(){{ if(hiOn&&!pinned) hi(null); }});
+
+  keys.forEach(function(k){{
+    var l=k.getAttribute('data-l');
+    k.addEventListener('mouseenter',function(){{ if(!pinned) show(l); }});
+    k.addEventListener('mouseleave',function(){{ if(!pinned) show(null); }});
+    k.addEventListener('click',function(){{
+      pinned = (pinned===l) ? null : l; show(pinned||l);
+      if(!pinned) show(null);
+    }});
+  }});
+  lg.addEventListener('mouseleave',function(){{ if(!pinned) show(null); }});
+  var sel=document.getElementById('wsel');
+  if(sel){{
+    sel.addEventListener('change',function(){{
+      [].forEach.call(document.querySelectorAll('.wpanel'),function(p){{
+        p.hidden = (p.id !== sel.value);
+      }});
+    }});
+  }}
+}})();
+</script>
 """
 
 
