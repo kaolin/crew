@@ -265,6 +265,31 @@ def build():
 
     tok_rail = rail([(k[:10], int(k[11:13])) for k, _, _ in tok])
     seven_rail = rail([(ts[:10], int(ts[11:13])) for ts, _ in seven])
+
+    # The per-model weekly cap (Fable today). Sampled only since 2026-09-12,
+    # so the run is short; drawn against a FIXED 0-100 axis because the point
+    # of this panel is distance to the cap, not the shape of the climb.
+    fable_rows = [r for r in rows if (r.get("fable_pct") or "") != ""]
+    fable = [(r["ts"], float(r["fable_pct"])) for r in fable_rows]
+    if len(fable) > MAXBARS:
+        step = -(-len(fable) // MAXBARS)
+        fable = [fable[i:i + step][-1] for i in range(0, len(fable), step)]
+    fable_bars, prev = [], None
+    for pair in fable:
+        ts, v = pair
+        g = grade(prev, pair)
+        fable_bars.append(
+            f'<div class="bar" title="{ts.replace(chr(84), chr(32))} — {v:.0f}% of the Fable '
+            f'weekly cap, {SLOPE_NAME[g]}">'
+            f'<i style="height:{min(100.0, v):.2f}%;background:var(--s{g})"></i></div>')
+        prev = pair
+    fable_bars = "".join(fable_bars)
+    fable_axis = yaxis(100, 4, lambda x: f"{x:.0f}%")
+    fable_now = f"{fable[-1][1]:.0f}" if fable else "n/a"
+    fable_since = fable[0][0].replace("T", " ")[:16] if fable else "not yet sampled"
+    fable_resets = (fable_rows[-1].get("fable_resets") or "") if fable_rows else ""
+    fable_resets = fable_resets[:16].replace("T", " ") + " UTC" if fable_resets else "unknown"
+    fable_rail = rail([(ts[:10], int(ts[11:13])) for ts, _ in fable]) if fable else ""
     # built after bucketing so it stays 1:1 with the columns
     _five_rail_src = five
 
@@ -325,6 +350,8 @@ def build():
         slope_light=" ".join(f"--s{i}:{c};" for i, c in enumerate(SLOPE_LIGHT)),
         slope_dark=" ".join(f"--s{i}:{c};" for i, c in enumerate(SLOPE_DARK)),
         week_now=f"{seven[-1][1]:.0f}", samples=len(rows), seven_top=seven_top,
+        fable_bars=fable_bars, fable_axis=fable_axis, fable_now=fable_now,
+        fable_since=fable_since, fable_resets=fable_resets, fable_rail=fable_rail,
         cat_light=" ".join(f"--cat{i}:{c};" for i, c in enumerate(CAT_LIGHT)),
         cat_dark=" ".join(f"--cat{i}:{c};" for i, c in enumerate(CAT_DARK)),
     )
@@ -475,6 +502,22 @@ td.num,th.num{{text-align:right;white-space:nowrap}}
   <div class="rail">{sample_rail}</div>
   <div class="legend">{slope_legend}</div></div>
   <div class="axis"><span>0–{seven_top}% of the weekly limit</span><span>now {week_now}%</span></div>
+</section>
+
+<section style="--bw:4px">
+  <h2>Fable weekly cap</h2>
+  <p class="note">The per-model cap the plan applies on top of the weekly
+     window: Fable has its own 7-day allowance, and when it reaches 100% the
+     model is locked until Thursday's reset even if the weekly window has
+     headroom. Axis fixed at 0–100% so the cap is where the bars stop. Sampled
+     since {fable_since}; earlier weeks were not recorded.</p>
+  <div class="chart"><div class="plot">
+    <div class="yax">{fable_axis}</div>
+    <div class="plotbody"><div class="bars grid">{fable_bars}</div></div>
+  </div>
+  <div class="rail">{fable_rail}</div>
+  <div class="legend">{slope_legend}</div></div>
+  <div class="axis"><span>resets {fable_resets}</span><span>now {fable_now}%</span></div>
 </section>
 
 <section style="--bw:4px">
