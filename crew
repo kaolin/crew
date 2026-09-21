@@ -365,6 +365,22 @@ def cmd_restore(a):
     # have no homeSpace field, and picks up alias-file edits made since the snapshot.
     spaces = [] if getattr(a, "as_found", False) else _spaces(getattr(a, "spaces_source", None))
     homeless = []
+    # Reconcile against what's ALREADY running: restore is a recreate-from-manifest
+    # and, on its own, knows nothing about live sessions. A re-run — or a run after a
+    # partial crash where some sessions survived — used to open a second window per
+    # entry and re-resume a sessionId that's already attached, which drops you to a
+    # bare shell (the "empty window" kaolin sees). So read the live set first and skip
+    # any entry whose sessionId is already running. --recreate opts back into the old
+    # blind behaviour for a genuine clean boot (nothing running yet).
+    recreate = getattr(a, "recreate", False)
+    live_sids = set()
+    if not recreate:
+        try:
+            live_sids = {s.get("sessionId") for s in load() if s.get("sessionId")}
+        except Exception as e:
+            print(c("33", f"  ⚠ couldn't read live sessions ({e}); treating all as dead. "
+                          "Pass --recreate to open everything intentionally."))
+    skipped = 0
     # A window opened by AppleScript while the login screen is up never starts its
     # shell (2026-09-03 12:05: "✓ orrery → Space 12", no login process, no claude,
     # an empty pane until unlock). Refuse rather than leave a trail of dead windows;
@@ -394,13 +410,19 @@ def cmd_restore(a):
         cwd, sid, name = s.get("cwd"), s.get("sessionId"), s.get("name") or ""
         if not cwd or not sid:
             continue
+        if sid in live_sids:   # already running — reconcile, don't recreate
+            print("  " + c("32", "● " + "live".ljust(8)) + f" {name.ljust(20)} "
+                  + c("2", "already running → skip"))
+            skipped += 1
+            continue
         space, moved = s.get("space"), None
         home = _space_for_session(s, spaces) if spaces else None
         if home and home.get("uuid") != space:
             if space:
                 moved = "was on " + _wherestr(s.get("spaceIndex"), s.get("spaceTag"))
             space, s = home["uuid"], {**s, "spaceIndex": home.get("index"), "spaceTag": home.get("tag")}
-        if spaces and not home:
+        is_homeless = bool(spaces) and not home
+        if is_homeless:
             homeless.append((name, proj(cwd)))
         where = _wherestr(s.get("spaceIndex"), s.get("spaceTag")) if space else "current Space"
         if moved:
@@ -435,7 +457,9 @@ def cmd_restore(a):
             subprocess.run(["osascript", "-e", script], check=False)
             print(f"  ✓ {name.ljust(20)} → {where}")
         else:
-            print(f"  would put {name.ljust(20)} → {where}   ({resume})")
+            glyph = (c("33", "○ " + "homeless".ljust(8)) if is_homeless
+                     else c("2", "○ " + "dead".ljust(8)))
+            print("  " + glyph + f" {name.ljust(20)} → {where}   " + c("2", f"({resume})"))
         launched += 1
     if homeless:
         print(c("33", f"\n  ⚠ {len(homeless)} session(s) with no Space tag — left on whatever Space was current:"))
@@ -450,8 +474,16 @@ def cmd_restore(a):
             print(f"  ✓ trusted {cwd}")
         for _, cwd in left:
             print(c("33", f"  ⚠ {cwd}: no trust prompt seen — look at the window"))
+    if a.go and skipped:
+        print(c("2", f"\n  reconciled: opened {launched}, skipped {skipped} already-live session(s)."))
     if not a.go:
-        print(f"\n# dry-run: {launched} sessions. re-run with --go to open + place + resume.")
+        note = f"\n# dry-run: {launched} would open"
+        if skipped:
+            note += f", {skipped} already live (skipped)"
+        note += ". re-run with --go to open + place + resume."
+        if recreate:
+            note += "  [--recreate: live state ignored]"
+        print(note)
 
 
 # ---- dispatch: attach to the live iTerm2 session behind a Claude pid ----
@@ -3042,6 +3074,9 @@ def main():
     pr.add_argument("--spaces-source", dest="spaces_source", help="spaces JSON (testing; default: live `spacetag dump`)")
     pr.add_argument("--even-locked", dest="even_locked", action="store_true",
                     help="open windows even though the screen is locked (they usually never start)")
+    pr.add_argument("--recreate", action="store_true",
+                    help="ignore live sessions and open a window for every manifest entry "
+                         "(clean-boot behaviour; default skips already-running sessionIds)")
     pr.set_defaults(fn=cmd_restore)
     plk = sub.add_parser("locked", help="is the login screen up? (exit 0 locked / 1 unlocked)")
     plk.set_defaults(fn=cmd_locked)
