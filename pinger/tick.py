@@ -774,6 +774,54 @@ def pending_via_crew(name, timeout=10):
     return rows[:20]
 
 
+def pending_kind_via_crew(name, timeout=10):
+    """Ask `crew pending <name> --json` and return (kind, detail) where kind is
+    'question' | 'permission' | None — crew's OWN classification, which requires
+    the AskUserQuestion picker chrome to call something a question and returns
+    None for a permission dialog.
+
+    This replaces re-grepping crew's prose for '1.' / 'Enter to select', which
+    filed every numbered permission dialog (subagent/Task approvals, the
+    2026-09-22 Fable spam) as a 'question' and so paged kaolin past the
+    approver-covered suppression (review #3).
+
+    Falls back to a HARDENED text scrape (requires the picker chrome, never a
+    bare '1.') if --json is unavailable — e.g. an older crew."""
+    try:
+        out = subprocess.run([CREW_BIN, "pending", name, "--json"],
+                             capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+    if out.returncode == 0 and out.stdout.strip():
+        try:
+            recs = json.loads(out.stdout)
+            for r in recs:
+                if r.get("name") == name or not name:
+                    detail = r.get("detail") or ""
+                    if r.get("options"):
+                        detail = (detail + " — " + " / ".join(r["options"])).strip(" —")
+                    return r.get("kind"), detail
+            if recs:
+                r = recs[0]
+                detail = r.get("detail") or ""
+                if r.get("options"):
+                    detail = (detail + " — " + " / ".join(r["options"])).strip(" —")
+                return r.get("kind"), detail
+            return None, ""
+        except (ValueError, TypeError, AttributeError):
+            pass   # not JSON (older crew) — fall through to the hardened scrape
+    # Fallback: text rows, but a question REQUIRES the AskUserQuestion picker
+    # chrome — a bare "1." is not enough (that was the false-positive).
+    rows = pending_via_crew(name, timeout=timeout)
+    if not rows:
+        return None, ""
+    detail = "\n".join(rows)
+    ask_chrome = ("↑/↓ to navigate", "Enter to select")
+    if any(m in detail for m in ask_chrome):
+        return "question", detail
+    return "permission", detail
+
+
 def find_artifacts(path, since, cap=MAX_ARTIFACTS):
     """Image files the session named in its closing message, written this episode."""
     found, seen = [], set()
@@ -1197,11 +1245,20 @@ def main():
             if (NOTIFY_WAITING and not notified and not first_run
                     and name not in EXCLUDE_NAMES):
                 detail = pend[1] if pend else ""
-                extra = pending_via_crew(name) if not detail else []   # sees screen-only prompts
-                if not detail and extra:
-                    detail = "\n".join(extra)
-                    if any(k in detail for k in ("Enter to select", "1.")):
-                        pend = ("question", detail)
+                if not detail:
+                    # Ask crew for its OWN structured classification instead of
+                    # re-grepping its prose for "1." — that mislabeled numbered
+                    # permission dialogs as questions and paged kaolin past the
+                    # approver-covered suppression (review #3, 2026-09-22 Fable
+                    # spam). kind None means "waiting but not classifiable"; we
+                    # do NOT invent a question from it.
+                    kind, jdetail = pending_kind_via_crew(name)   # sees screen-only prompts
+                    if jdetail:
+                        detail = jdetail
+                    if kind == "question":
+                        pend = ("question", detail or "(see the screen)")
+                    elif kind == "permission":
+                        pend = ("permission", detail or "permission prompt")
                 if pend and pend[0] == "question":
                     glyph, what = "🙋", "needs your answer"
                 else:
