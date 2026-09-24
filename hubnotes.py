@@ -17,10 +17,36 @@ screen — not when the relay succeeds.
     hubnotes all [app]                     # open + closed
     hubnotes stale [hours]                 # open longer than N hours (default 12)
 """
-import sys, os, io, json, time, argparse
+import sys, os, io, json, time, argparse, fcntl, contextlib
 
 HOME = os.path.expanduser("~")
 LEDGER = os.path.join(HOME, ".claude", "status", "_hubnotes.jsonl")
+LOCK = LEDGER + ".lock"
+
+
+@contextlib.contextmanager
+def _locked():
+    """Serialize the whole read-modify-write across processes.
+
+    Every mutation is _rows() (read the whole ledger) -> mutate -> _write()
+    (atomic os.replace). Two concurrent `hubnotes add/close` with no lock both
+    read the same ledger, both compute the same next id, and the second replace
+    silently discards the first note/close — the one genuine cross-process race
+    (review #9). An exclusive flock held for the duration makes the read happen
+    on the state the previous writer left, so nothing is lost. The atomic write
+    still protects readers (list/all/stale) from ever seeing a torn file, so
+    those stay lock-free."""
+    os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+    fh = open(LOCK, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        fh.close()
 
 
 def _rows():
@@ -55,16 +81,17 @@ def _next_id(rows):
 
 
 def cmd_add(a):
-    rows = _rows()
-    nid = _next_id(rows)
-    rows.append({
-        "id": nid,
-        "app": a.app,
-        "text": a.text.strip(),
-        "sent": _stamp(),
-        "state": "open",
-    })
-    _write(rows)
+    with _locked():
+        rows = _rows()
+        nid = _next_id(rows)
+        rows.append({
+            "id": nid,
+            "app": a.app,
+            "text": a.text.strip(),
+            "sent": _stamp(),
+            "state": "open",
+        })
+        _write(rows)
     print("#%d %s" % (nid, a.app))
 
 
@@ -119,34 +146,36 @@ def cmd_all(a):
 
 
 def cmd_close(a):
-    rows = _rows()
-    hit = None
-    for r in rows:
-        if r.get("id") == a.id:
-            hit = r
-            break
-    if not hit:
-        print("no note #%d" % a.id)
-        return
     if not a.evidence.strip():
         print("evidence is required — that is the entire point of this ledger")
         return
-    hit["state"] = "done"
-    hit["evidence"] = a.evidence.strip()
-    hit["closed"] = _stamp()
-    _write(rows)
+    with _locked():
+        rows = _rows()
+        hit = None
+        for r in rows:
+            if r.get("id") == a.id:
+                hit = r
+                break
+        if not hit:
+            print("no note #%d" % a.id)
+            return
+        hit["state"] = "done"
+        hit["evidence"] = a.evidence.strip()
+        hit["closed"] = _stamp()
+        _write(rows)
     print("closed #%d" % a.id)
 
 
 def cmd_reopen(a):
-    rows = _rows()
-    for r in rows:
-        if r.get("id") == a.id:
-            r["state"] = "open"
-            r["evidence"] = "REOPENED: " + a.why.strip()
-            _write(rows)
-            print("reopened #%d" % a.id)
-            return
+    with _locked():
+        rows = _rows()
+        for r in rows:
+            if r.get("id") == a.id:
+                r["state"] = "open"
+                r["evidence"] = "REOPENED: " + a.why.strip()
+                _write(rows)
+                print("reopened #%d" % a.id)
+                return
     print("no note #%d" % a.id)
 
 
@@ -156,32 +185,33 @@ def cmd_shelve(a):
     backlog nobody is going to evidence stops nagging kaolin every idle stretch.
     Not closed: closing needs evidence, and there is none."""
     now = time.time()
-    rows = _rows()
-    done, refused = [], []
-    for r in rows:
-        if r.get("state") != "open":
-            continue
-        if a.app and r.get("app") != a.app:
-            continue
-        try:
-            t = time.mktime(time.strptime(r["sent"], "%Y-%m-%d %H:%M"))
-        except Exception:
-            continue
-        if now - t < a.older * 3600:
-            continue
-        # Refuse when the app has moved since the note was filed: its status file
-        # is newer than the note, so the note may already be fixed and needs
-        # closing with evidence, not hiding. (#58/#59 were fixed three days before
-        # a blanket shelve buried them, 2026-09-03.) --force overrides.
-        touched = _app_touched_since(r.get("app"), t)
-        if touched and not a.force:
-            refused.append((r, touched))
-            continue
-        r["state"] = "stale"
-        r["shelved"] = _stamp()
-        done.append(r)
-    if done:
-        _write(rows)
+    with _locked():
+        rows = _rows()
+        done, refused = [], []
+        for r in rows:
+            if r.get("state") != "open":
+                continue
+            if a.app and r.get("app") != a.app:
+                continue
+            try:
+                t = time.mktime(time.strptime(r["sent"], "%Y-%m-%d %H:%M"))
+            except Exception:
+                continue
+            if now - t < a.older * 3600:
+                continue
+            # Refuse when the app has moved since the note was filed: its status file
+            # is newer than the note, so the note may already be fixed and needs
+            # closing with evidence, not hiding. (#58/#59 were fixed three days before
+            # a blanket shelve buried them, 2026-09-03.) --force overrides.
+            touched = _app_touched_since(r.get("app"), t)
+            if touched and not a.force:
+                refused.append((r, touched))
+                continue
+            r["state"] = "stale"
+            r["shelved"] = _stamp()
+            done.append(r)
+        if done:
+            _write(rows)
     print("shelved %d note(s) open longer than %dh%s" % (len(done), a.older, (" in " + a.app) if a.app else ""))
     for r in done:
         print(_fmt(r, now))
@@ -216,14 +246,15 @@ def _app_touched_since(app, since_epoch):
 
 
 def cmd_unshelve(a):
-    rows = _rows()
-    for r in rows:
-        if r.get("id") == a.id and r.get("state") == "stale":
-            r["state"] = "open"
-            r.pop("shelved", None)
-            _write(rows)
-            print("reopened #%d" % a.id)
-            return
+    with _locked():
+        rows = _rows()
+        for r in rows:
+            if r.get("id") == a.id and r.get("state") == "stale":
+                r["state"] = "open"
+                r.pop("shelved", None)
+                _write(rows)
+                print("reopened #%d" % a.id)
+                return
     print("no stale note #%d" % a.id)
 
 
