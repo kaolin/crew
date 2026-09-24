@@ -503,10 +503,59 @@ def _resolve(sessions, key):
 
 
 def _tty_of(pid):
+    # Kept deliberately permissive: this is on the read/scrape path (status,
+    # peek, pending), so a false negative here would break a legitimate
+    # session's screen scrape. Identity is verified separately, and only on the
+    # WRITE path, by _verify_write_target (review #4).
     if not pid:
         return None
     out = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return None if not out or out == "??" else "/dev/" + out
+
+
+def _proc_cmd(pid):
+    """The live command line for a pid, or '' if it is gone."""
+    if not pid:
+        return ""
+    return subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _launched_name(cmd):
+    """The value of --name in a claude launch command, or None. The name can
+    contain spaces ('[claude] izzit'), so read to the next flag / end."""
+    m = re.search(r"--name\s+(.+?)(?:\s+--\S|$)", cmd or "")
+    return m.group(1).strip() if m else None
+
+
+def _verify_write_target(s, tty):
+    """Confirm, right before a keystroke write, that `tty` still belongs to the
+    session we resolved — not a tty a recycled pid now points at, nor a window
+    that moved (review #4). `claude agents --json` can report a just-exited
+    session's stale pid, and macOS recycles both pids and /dev/ttysNNN, so a
+    stale pid->tty can land on a DIFFERENT live session and we'd drive it blind.
+
+    Re-resolves the pid->tty mapping fresh, requires the live process to still
+    look like claude, and — when the launch args carry a --name — requires that
+    name to match EXACTLY (so '[claude] izzit' is not accepted for a pid now
+    running '[claude] izzit-site-wild').
+
+    Returns (ok, reason). reason is 'gone' (pid dead / tty vanished) or
+    'mismatch' (tty moved, pid reused, or a different session's name)."""
+    pid = s.get("pid")
+    fresh = _tty_of(pid)
+    if not fresh:
+        return False, "gone"
+    if fresh != tty:
+        return False, "mismatch"
+    cmd = _proc_cmd(pid)
+    if cmd and not re.search(r"claude|node|\.local/bin", cmd):
+        return False, "mismatch"          # pid reused by a non-claude process
+    name = s.get("name")
+    launched = _launched_name(cmd)
+    if name and launched and launched != name:
+        return False, "mismatch"          # pid now runs a DIFFERENT session
+    return True, None
 
 
 def _parse_flags(args):
@@ -613,22 +662,41 @@ _OSA_JUMP = """on run argv
 end run"""
 
 
-def _pick(name):
+# Machine-readable exit codes for the write verbs (keys/tell), so a caller —
+# the hub's approver loops above all — can tell "delivered" from the several
+# ways a send silently did nothing (review #1). These match cmd_at_prompt's
+# convention: 2 == no such session, 3 == could not reach it.
+EXIT_OK          = 0   # delivered
+EXIT_NO_SESSION  = 2   # the name resolves to no running session
+EXIT_UNREACHABLE = 3   # session exists but its window/tty could not be driven
+EXIT_AMBIGUOUS   = 4   # the name matches more than one session
+EXIT_REFUSED     = 5   # refused for safety (waiting/busy) without --force
+
+
+def _pick2(name):
+    """Like _pick, but also returns WHY it failed so the write verbs can map it
+    to a distinct exit code. Returns (session|None, tty|None, reason) where
+    reason is one of None (ok), 'nomatch', 'ambiguous', 'notty'."""
     sessions = load()
     matches = _resolve(sessions, name)
     if not matches:
         print(f"no running session matches '{name}'")
-        return None, None
+        return None, None, "nomatch"
     if len(matches) > 1:
         print(f"'{name}' is ambiguous — matches:")
         for m in matches:
             print(f"    {m.get('name')}   {proj(m.get('cwd'))}   [{m.get('status')}]")
-        return None, None
+        return None, None, "ambiguous"
     s = matches[0]
     tty = _tty_of(s.get("pid"))
     if not tty:
         print(f"couldn't find the tty for {s.get('name')} (pid {s.get('pid')})")
-        return None, None
+        return None, None, "notty"
+    return s, tty, None
+
+
+def _pick(name):
+    s, tty, _ = _pick2(name)
     return s, tty
 
 
@@ -1410,21 +1478,30 @@ def cmd_keys(a):
     `crew keys disasteroids-bc space down down space enter`
     Anything not a named key is typed literally. Use for multi-select pickers;
     for ordinary prompts use `tell`."""
-    s, tty = _pick(a.name)
+    s, tty, reason = _pick2(a.name)
     if not s:
-        return
+        sys.exit(EXIT_NO_SESSION if reason == "nomatch"
+                 else EXIT_AMBIGUOUS if reason == "ambiguous"
+                 else EXIT_UNREACHABLE)   # 'notty'
     if s.get("status") == "waiting" and not a.force:
         p = _pending(s)
         print(c("33;1", f"{s.get('name')} is WAITING — {_pending_line(p)}"))
         print(c("2", "  keys is how you answer it; pass --force once you've read the screen."))
-        return
+        sys.exit(EXIT_REFUSED)
+    # Identity check right before the write: don't drive a tty a recycled pid /
+    # moved window now points at (review #4).
+    ok, why = _verify_write_target(s, tty)
+    if not ok:
+        print(f"{s.get('name')} not reachable — {'window/pid moved' if why == 'mismatch' else 'session gone'} "
+              f"(tty {tty}); sent nothing")
+        sys.exit(EXIT_UNREACHABLE)
     ad = adapter_for(tty)
     sent = []
     for tok in a.key:
         chunk = _KEYS.get(tok.lower(), tok)
         if not ad.keys(tty, chunk):
             print(f"{s.get('name')} not reachable via {ad.name} (tty {tty}) — sent {sent}")
-            return
+            sys.exit(EXIT_UNREACHABLE)
         sent.append(tok)
         time.sleep(a.delay)
     print(f"→ sent {sent} to {s.get('name')} ({proj(s.get('cwd'))})")
@@ -1443,6 +1520,28 @@ def cmd_pending(a):
     else:
         rows = [x for x in (load(include_all=True) or [])
                 if x.get("status") == "waiting" and x.get("name") not in ("hub",)]
+    if getattr(a, "json", False):
+        # Structured output so the pinger (and any watcher) can consume the
+        # SAME classification crew already computes — question vs permission vs
+        # unknown — instead of re-grepping this command's prose and mislabeling
+        # a permission dialog as a question because it lists "1." options
+        # (review #3, the 2026-09-22 Fable spam). kind is one of
+        # question|permission|null; null means "waiting but nothing classifiable
+        # (yet)", never "safe to press Enter".
+        out = []
+        for s in rows:
+            p = _pending(s)
+            out.append({
+                "name": s.get("name"),
+                "project": proj(s.get("cwd")),
+                "status": s.get("status"),
+                "kind": (p or {}).get("kind"),
+                "tool": (p or {}).get("tool"),
+                "detail": (p or {}).get("detail", ""),
+                "options": (p or {}).get("options", []),
+            })
+        print(json.dumps(out, ensure_ascii=False))
+        return
     if not rows:
         print("nothing waiting — no session is blocked on you.")
         return
@@ -1521,18 +1620,28 @@ def _one_line(msg):
 
 
 def cmd_tell(a):
-    s, tty = _pick(a.name)
+    s, tty, reason = _pick2(a.name)
     if not s:
-        return
+        sys.exit(EXIT_NO_SESSION if reason == "nomatch"
+                 else EXIT_AMBIGUOUS if reason == "ambiguous"
+                 else EXIT_UNREACHABLE)   # 'notty'
     if not a.force and _blocked_refusal(s, "send"):
-        return
+        sys.exit(EXIT_REFUSED)
     if s.get("status") == "busy" and not a.force and not at_prompt(s):
         print(f"{s.get('name')} is busy (mid-turn). --force to send anyway (it'll queue).")
-        return
+        sys.exit(EXIT_REFUSED)
+    ok, why = _verify_write_target(s, tty)
+    if not ok:
+        print(f"{s.get('name')} not reachable — {'window/pid moved' if why == 'mismatch' else 'session gone'} "
+              f"(tty {tty}); sent nothing")
+        sys.exit(EXIT_UNREACHABLE)
     ad = adapter_for(tty)
     ok = ad.tell(tty, _one_line(a.message))
-    print(f"→ sent to {s.get('name')} ({proj(s.get('cwd'))})" if ok
-          else f"{s.get('name')} not reachable via {ad.name} (tty {tty})")
+    if ok:
+        print(f"→ sent to {s.get('name')} ({proj(s.get('cwd'))})")
+    else:
+        print(f"{s.get('name')} not reachable via {ad.name} (tty {tty})")
+        sys.exit(EXIT_UNREACHABLE)
 
 
 def cmd_ask(a):
@@ -3046,6 +3155,91 @@ def cmd_tg_patch(a):
         print("current poller: pid %d" % pid)
 
 
+def _tg_token():
+    """The bot token from the telegram channel .env, or None."""
+    try:
+        for line in io.open(os.path.join(TG_DIR, ".env"), encoding="utf-8"):
+            line = line.strip()
+            if line.startswith("TELEGRAM_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def _tg_chats():
+    """Chat ids allowed to reach kaolin (access.json allowFrom), as strings."""
+    try:
+        d = json.load(io.open(os.path.join(TG_DIR, "access.json"), encoding="utf-8"))
+        return [str(x) for x in (d.get("allowFrom") or [])]
+    except Exception:
+        return []
+
+
+def cmd_escalate(a):
+    """Page kaolin that a prompt would not clear — the approver's dead-man switch.
+
+    The pinger deliberately SUPPRESSES 'blocked on a permission prompt' for
+    approver-covered sessions (so Chrome-consent spam does not reach the phone),
+    which means when an approver's keystrokes silently fail — an unreachable /
+    moved window, a stale tty, a dialog shape it does not recognise — nothing
+    else pages kaolin, and the session can sit frozen for hours (review #1, the
+    8h writersplanner stall). So after N failed attempts on the SAME still-
+    `waiting` prompt the approver calls this, which:
+
+      1. appends a durable event to the pinger queue (surfaced by `crew brief`), and
+      2. pushes it straight to Telegram via the bot API (sendMessage only — no
+         getUpdates, so it never fights the hub's single poller).
+
+    Best-effort and idempotent-ish: the approver rate-limits how often it calls."""
+    name, text = a.name, a.message
+    headline = f"approver stuck on {name}: {text}"
+    # 1) durable queue — reuse the pinger's record shape so `crew brief` renders it.
+    seq = 1
+    try:
+        for ln in io.open(PINGER_QUEUE, encoding="utf-8"):
+            ln = ln.strip()
+            if ln:
+                try:
+                    seq = max(seq, json.loads(ln).get("seq", 0) + 1)
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    rec = {"seq": seq, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+           "kind": "🆘", "session": name, "project": (a.project or proj_name(name)),
+           "text": headline}
+    try:
+        os.makedirs(os.path.dirname(PINGER_QUEUE), exist_ok=True)
+        with io.open(PINGER_QUEUE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        print(f"queued escalation #{seq} for {name}")
+    except Exception as e:
+        print(f"queue append failed: {e}")
+    # 2) direct Telegram push (the queue alone won't ping his phone).
+    if a.no_push:
+        return
+    token, chats = _tg_token(), _tg_chats()
+    if not token or not chats:
+        print("no telegram token/chats — escalation queued only")
+        return
+    import urllib.request as _u, urllib.parse as _up
+    body = f"🆘 {name}: {text}"
+    for chat in chats:
+        try:
+            data = _up.urlencode({"chat_id": chat, "text": body}).encode()
+            req = _u.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+            _u.urlopen(req, timeout=10).read()
+            print(f"pushed to {chat}")
+        except Exception as e:
+            print(f"telegram push to {chat} failed: {e}")
+
+
+def proj_name(name):
+    """Best-effort project label from a session name for escalation records."""
+    return (name or "").replace("[claude] ", "", 1)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="crew", description="read-only status + restore for your Claude sessions")
     ap.set_defaults(fn=cmd_status, source=None, all=False, go=False, out=None)
@@ -3105,6 +3299,9 @@ def main():
     pp = sub.add_parser("pending", help="what blocked sessions need from you (questions vs permission prompts)")
     pp.add_argument("name", nargs="?", help="one session; omit for every waiting session")
     pp.add_argument("--lines", type=int, default=18, help="screen lines to scrape when the transcript has nothing")
+    pp.add_argument("--json", action="store_true",
+                    help="machine-readable: [{name,project,status,kind,tool,detail,options}] "
+                         "(kind = question|permission|null) for the pinger/approvers")
     pp.set_defaults(fn=cmd_pending)
     pap = sub.add_parser("at-prompt",
                          help="exit 0 if the session shows an empty input box (busy only from a bg task)")
@@ -3183,6 +3380,14 @@ def main():
     phk.add_argument("--yes", action="store_true",
         help="actually write ~/.claude/settings.json (install/uninstall print the change and refuse without it)")
     phk.set_defaults(fn=cmd_hooks)
+    pesc = sub.add_parser("escalate",
+        help="page kaolin that a prompt won't clear (approver dead-man switch): queue + Telegram push")
+    pesc.add_argument("name")
+    pesc.add_argument("message")
+    pesc.add_argument("--project", help="project label for the queue record (default: derived from name)")
+    pesc.add_argument("--no-push", dest="no_push", action="store_true",
+                      help="queue the event only; do not push to Telegram")
+    pesc.set_defaults(fn=cmd_escalate)
     a = ap.parse_args()
     a.fn(a)
 
