@@ -29,6 +29,13 @@ STATE_PATH  = f"{HOME}/dev/crew/pinger/state.json"
 LOG_PATH    = f"{HOME}/dev/crew/pinger/pinger.log"
 INBOUND_LOG    = f"{HOME}/.claude/channels/telegram/inbound.jsonl"
 INBOUND_CURSOR = f"{HOME}/.claude/channels/telegram/inbound.cursor"
+# actioned.cursor advances only when the HUB confirms it handled a message —
+# unlike inbound.cursor, which the tgpatch treats as untrustworthy because a
+# send can "succeed" into a stale transport nobody reads while inbound.cursor
+# advances anyway (the 2026-08-02 six-lost-messages). So a backlog measured
+# against actioned.cursor catches the exact drop the inbound-cursor detector
+# misses (review #5).
+ACTIONED_CURSOR = f"{HOME}/.claude/channels/telegram/actioned.cursor"
 BOT_PID_FILE   = f"{HOME}/.claude/channels/telegram/bot.pid"
 # The hub can only be woken by kaolin, so a Telegram push it never sees is a
 # dead end: every event also lands here, and `crew brief` replays what the hub
@@ -62,6 +69,10 @@ EXCLUDE_NAMES     = {"hub"}     # sessions to never ping about (the hub itself)
 APPROVER_COVERED_FILE = os.path.expanduser("~/.crew/hub/approver-covered.txt")
 QUIET_HOURS       = None       # e.g. (23, 8) to mute 23:00-08:00 local; None = off
 TUNNEL_STALL_SECS = 120        # inbound queued-but-undelivered longer than this -> tunnel is down
+ACTIONED_STALL_SECS = 1800     # inbound DELIVERED but not confirmed-actioned this long -> hub isn't
+                               # processing (a false "delivered" into a dead transport, or a stuck hub).
+                               # Longer than TUNNEL_STALL_SECS on purpose: a message legitimately waits
+                               # while the hub works or kaolin hasn't answered, so only a long silence pages.
 POLLER_DOWN_SECS  = 180        # bot poller process dead this long -> whole bridge down (rides out a brief restart)
 
 # "finished" alerts carry WHAT finished, plus any images the session just made.
@@ -1032,6 +1043,67 @@ def check_tunnel(now, state):
     return already
 
 
+def actioned_backlog(now):
+    """(count, oldest_age_secs) of inbound records logged but NOT yet confirmed
+    ACTIONED by the hub (seq > actioned.cursor). Same shape as tunnel_backlog,
+    but measured against the trustworthy cursor: this stays >0 even when a
+    message was 'delivered' into a transport nobody read, which is exactly the
+    drop inbound.cursor hides (review #5). Absent/empty log -> (0, 0)."""
+    try:
+        cur = int(open(ACTIONED_CURSOR).read().strip() or "0")
+    except (OSError, ValueError):
+        cur = 0
+    n, oldest = 0, None
+    try:
+        with open(INBOUND_LOG, errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("seq", 0) > cur:
+                    n += 1
+                    try:
+                        ep = calendar.timegm(time.strptime((r.get("ts") or "")[:19],
+                                                           "%Y-%m-%dT%H:%M:%S"))
+                    except ValueError:
+                        ep = now
+                    if oldest is None or ep < oldest:
+                        oldest = ep
+    except OSError:
+        return (0, 0)
+    return (n, (now - oldest) if oldest else 0)
+
+
+def check_actioned_stall(now, state):
+    """Alert once when inbound has sat DELIVERED-but-unactioned past
+    ACTIONED_STALL_SECS — the backlog the inbound-cursor tunnel check can't see
+    (review #5). Suppressed while the tunnel or poller alert already fired (same
+    outage, don't double-page). Out-of-band via the bot API. Returns the flag."""
+    already = bool(state.get("actioned_stall_alerted"))
+    if state.get("tunnel_alerted") or state.get("poller_alerted"):
+        return already                       # a louder alert already covers this outage
+    n, age = actioned_backlog(now)
+    stalled = n > 0 and age >= ACTIONED_STALL_SECS
+    if stalled and not already:
+        token, chats = load_token(), load_chats()
+        mins = age / 60
+        msg = (f"⚠️ Telegram inbound looks UNHANDLED — {n} message(s) logged ~{mins:.0f}m "
+               f"ago with no confirmed action by the hub.\n\nNothing is lost (durable log). "
+               f"If the hub is up, it may be stuck; check it, then `crew tg-unactioned` to "
+               f"review and `crew tg-actioned latest` once caught up.")
+        ok = all(send(token, c, msg) for c in chats) if chats else False
+        log(f"ACTIONED-STALL alert: {n} unactioned, oldest ~{mins:.0f}m, sent={ok}")
+        return True
+    if already and not stalled:
+        log("inbound caught up — re-arming actioned-stall alert")
+        return False
+    return already
+
+
 def poller_alive():
     """True/False whether the telegram bot poller (bot.pid) process is running;
     None if we can't tell (no pid file)."""
@@ -1108,6 +1180,11 @@ def main():
     state = load_state()
     tunnel_alerted = check_tunnel(now, state)                     # inbound queued-but-undelivered
     poller_alerted, poller_dead_since = check_poller(now, state)  # bridge process dead
+    # check_actioned_stall reads the flags check_tunnel/check_poller just set, so
+    # keep them current in `state` before calling it (it suppresses on either).
+    state["tunnel_alerted"] = tunnel_alerted
+    state["poller_alerted"] = poller_alerted
+    actioned_stall_alerted = check_actioned_stall(now, state)     # delivered-but-unactioned (review #5)
 
     sessions = get_sessions()
     if sessions is None:
@@ -1115,6 +1192,7 @@ def main():
         state["tunnel_alerted"] = tunnel_alerted
         state["poller_alerted"] = poller_alerted
         state["poller_dead_since"] = poller_dead_since
+        state["actioned_stall_alerted"] = actioned_stall_alerted
         state["updated"] = now
         save_state(state)
         return  # transient; launchd will retry next interval
@@ -1361,6 +1439,7 @@ def main():
                 "stalled_by_app": stalled_by_app,
                 "tunnel_alerted": tunnel_alerted,
                 "poller_alerted": poller_alerted,
+                "actioned_stall_alerted": actioned_stall_alerted,
                 "poller_dead_since": poller_dead_since})
 
     # Queue FIRST, and regardless of quiet hours or send success — the queue is
