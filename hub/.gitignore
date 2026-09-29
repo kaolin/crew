@@ -1,0 +1,41 @@
+# What does NOT go into a public repo, and why.
+#
+# kaolin/crew is PUBLIC on GitHub. The hub's own tooling is fine to publish --
+# it is generic fleet plumbing. What is not fine is the residue that tooling
+# leaves behind, because that residue is made of his private work. So the rule
+# is: COMMIT THE MACHINE, IGNORE WHAT WENT THROUGH IT.
+#
+# Each entry below is a class, not a file, so new residue of the same kind is
+# excluded automatically instead of relying on someone noticing it.
+
+# Approver and watcher logs. These are verbatim SCREEN SCRAPES of worker
+# sessions -- command lines, file paths, diffs, prompt text -- from private
+# repos. The single most sensitive thing in this directory.
+*.log
+
+# One-off relay drafts. Each is a message written for one session about one
+# piece of in-flight work: unreleased features, pricing decisions, store
+# strategy. No reuse value, and publishing them would publish the decisions.
+msg-*.txt
+
+# One-off fan-out runners. They hardcode session names and point at the
+# msg-*.txt files above, so they neither work elsewhere nor mean anything
+# without the drafts. `fanout.sh` (no hyphen) IS generic and IS committed.
+fanout-*.sh
+
+# Live operational state, rewritten constantly. Committing it would mean a diff
+# every time a session starts or stops, and it is a roster of what he is
+# working on rather than a tool.
+approver-covered.txt
+
+# App-specific one-offs: a worker brief carrying one app's unshipped bug
+# details, and an assembler for a private docs tree. Both reference work that
+# is his to disclose, not the hub's.
+timeful-task.md
+assemble-cheat.py
+
+# Hand-rolled backups (*.bak-YYYYMMDD, *.prev-YYYYMMDD). These predate the
+# scripts being tracked at all -- they ARE the thing git is for. Once history
+# exists they are noise, and in a public repo they are confusing noise.
+*.bak-*
+*.prev-*
