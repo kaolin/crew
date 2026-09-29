@@ -90,6 +90,20 @@ escalate_once() {   # $1=sig $2=message
 # the screen locked, and there is nothing to be gained by asking sooner.
 hold_for_human() { sleep 30; }
 
+# docker compose's `--force-recreate` is not a destructive `--force`. It rebuilds
+# containers, which is ordinary dev work, and on 2026-09-29 it stalled alethe
+# twice while the flag was merely STRING CONTENT inside a bin/revive rewrite --
+# text being edited, not a command being run. With the watch now holding instead
+# of exiting, each false positive costs a session ~25 minutes waiting for the
+# hub's next tick, so a recurring one is a real drag on the work.
+#
+# Scrub that ONE token before testing, leaving `--force` to catch everything
+# else. Every exemption here has to be earned by an observed false positive --
+# do not add flags speculatively, and never scrub a bare `--force`.
+is_destructive() {
+  printf '%s' "$1" | sed 's/--force-recreate/FORCE_RECREATE_OK/g' | grep -qiE "$DESTRUCTIVE"
+}
+
 approve() {   # $1=keys $2=sig $3=label $4=cmd-for-log
   if "$CREW" keys --force "$NAME" $1 >/dev/null 2>&1; then
     sleep 4
@@ -123,7 +137,7 @@ while [ "$(date +%s)" -lt "$end" ]; do
       echo "$(date +%H:%M:%S) HUMAN-ONLY (question): $detail" >> "$LOG"
       ;;
     permission)
-      if printf '%s' "$detail" | grep -qiE "$DESTRUCTIVE"; then
+      if is_destructive "$detail"; then
         echo "$(date +%H:%M:%S) STOP destructive-looking: $detail" >> "$LOG"
         escalate_once "$sig" "destructive-looking prompt needs your call: $(printf '%s' "$detail" | cut -c1-160)"
         hold_for_human; continue
@@ -146,7 +160,7 @@ while [ "$(date +%s)" -lt "$end" ]; do
         # auto-approves. The URL is on screen, so the destructive check below
         # still sees it.
         cmd=$(printf '%s' "$scr" | grep -oE 'https?://[^ ]+' | head -1)
-        if printf '%s' "$scr" | grep -qiE "$DESTRUCTIVE"; then
+        if is_destructive "$scr"; then
           echo "$(date +%H:%M:%S) STOP destructive-looking fetch: $cmd" >> "$LOG"
           escalate_once "$sig" "a fetch prompt looks destructive, needs your call: $cmd"
           hold_for_human; continue
@@ -162,7 +176,7 @@ while [ "$(date +%s)" -lt "$end" ]; do
         # a diff is not a command, so this can only false-POSITIVE (refuse), which
         # is the safe direction.
         cmd=$(printf '%s' "$scr" | grep -o 'Do you want to make this edit to.*' | head -1)
-        if printf '%s' "$scr" | grep -qiE "$DESTRUCTIVE"; then
+        if is_destructive "$scr"; then
           echo "$(date +%H:%M:%S) STOP destructive-looking text in an edit: $cmd" >> "$LOG"
           escalate_once "$sig" "an edit whose diff looks destructive needs your call: $cmd"
           hold_for_human; continue
@@ -170,7 +184,7 @@ while [ "$(date +%s)" -lt "$end" ]; do
         approve "enter" "$sig" "file-edit" "$cmd"
       elif printf '%s' "$scr" | grep -q "Do you want to proceed"; then
         cmd=$(printf '%s' "$scr" | grep '│' | sed 's/^[[:space:]]*│//' | tr '\n' ' ')
-        if printf '%s' "$cmd" | grep -qiE "$DESTRUCTIVE"; then
+        if is_destructive "$cmd"; then
           echo "$(date +%H:%M:%S) STOP destructive-looking (screen): $cmd" >> "$LOG"
           escalate_once "$sig" "destructive-looking prompt (screen) needs your call: $(printf '%s' "$cmd" | cut -c1-160)"
           hold_for_human; continue
