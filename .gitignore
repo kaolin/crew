@@ -9,3 +9,10 @@ pinger/*.log
 
 # sampled every 5 min by com.kaolin.claude-usage-sampler — local data, not source
 usage/readings.tsv
+
+# The hub's live operating manual: names kaolin, his paths and his projects.
+# Untracked on his word 2026-09-29 ("just awkward for that to be there"). It stays
+# on disk because the hub launcher reads it at startup; hub-protocol.example.md is
+# the sanitised version that IS tracked. History keeps the old copies by his
+# explicit choice -- he did not want it filtered.
+hub-protocol.md
