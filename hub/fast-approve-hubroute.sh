@@ -97,11 +97,22 @@ hold_for_human() { sleep 30; }
 # of exiting, each false positive costs a session ~25 minutes waiting for the
 # hub's next tick, so a recurring one is a real drag on the work.
 #
-# Scrub that ONE token before testing, leaving `--force` to catch everything
-# else. Every exemption here has to be earned by an observed false positive --
-# do not add flags speculatively, and never scrub a bare `--force`.
+# The same shape bit again at 16:56 the same day: headless Chrome's
+# `--force-device-scale-factor=2`, in the render loop that is most of what the
+# nandgame session exists to run. It sat escalated for 20 minutes.
+#
+# Scrub those tokens before testing, leaving `--force` to catch everything else.
+# Every exemption here has to be earned by an OBSERVED false positive -- do not
+# add flags speculatively, and never scrub a bare `--force`. Two entries is a
+# list; if this reaches four or five, stop adding and reconsider the rule itself
+# (matching `--force` only as a whole word would cover all of these at once, but
+# it would also stop catching a destructive `--force-<something>` nobody has met
+# yet, so it is a trade to make deliberately rather than by accretion).
 is_destructive() {
-  printf '%s' "$1" | sed 's/--force-recreate/FORCE_RECREATE_OK/g' | grep -qiE "$DESTRUCTIVE"
+  printf '%s' "$1" \
+    | sed -e 's/--force-recreate/FORCE_RECREATE_OK/g' \
+          -e 's/--force-device-scale-factor/FORCE_DSF_OK/g' \
+    | grep -qiE "$DESTRUCTIVE"
 }
 
 approve() {   # $1=keys $2=sig $3=label $4=cmd-for-log
