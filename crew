@@ -64,6 +64,8 @@ TG_PATCH_MARKERS = [
     ("edit handler", "edited_message:text"),
     ("reaction handler", "message_reaction"),
     ("allowed_updates", "allowed_updates"),
+    ("forum-topic thread passthrough", "THREAD_PASSTHROUGH"),
+    ("permission prompt fan-out", "PERM_FANOUT"),
 ]
 
 # lower rank = more urgent / sorts first
@@ -2350,19 +2352,45 @@ def cmd_tg_patch(a):
 
     for v, sp in need:
         vdir = os.path.dirname(sp)
-        shutil.copy2(sp, sp + ".orig-" + v)
-        if os.path.exists(inbound):
-            shutil.copy2(inbound, os.path.join(vdir, "inbound-log.ts"))
+        orig = sp + ".orig-" + v
+        _, missing = _tg_patch_state(v)
+        # local.patch is a diff from STOCK. All markers missing = the file is
+        # stock (an update reverted it): it becomes the new stock backup. Some
+        # present = an older local patch (e.g. before thread passthrough was
+        # added): rebuild from the saved stock, and never back that file up as
+        # "stock" -- doing so is what would lose the only clean copy.
+        partial = len(missing) < len(TG_PATCH_MARKERS)
+        if partial and not os.path.exists(orig):
+            print("  %s: FAILED -- carries an older patch and %s is missing; "
+                  "reinstall the plugin to get stock back" % (v, os.path.basename(orig)))
+            continue
+        base = orig if partial else sp
+        tmp = sp + ".crew-tmp"
+        shutil.copy2(base, tmp)
         with io.open(patch) as fh:
-            r = subprocess.run(["patch", "-p0", "-N", sp], stdin=fh,
-                               capture_output=True, text=True)
+            r = subprocess.run(["patch", "-p0", "-N", "--no-backup-if-mismatch", tmp],
+                               stdin=fh, capture_output=True, text=True)
+        for junk in (tmp + ".rej", tmp + ".orig"):
+            if os.path.exists(junk):
+                os.remove(junk)
         if r.returncode != 0:
+            os.remove(tmp)
             print("  %s: FAILED -- %s" % (v, (r.stderr or r.stdout).strip()[:200]))
             continue
+        if partial:
+            shutil.copy2(sp, sp + ".prev")
+        else:
+            shutil.copy2(sp, orig)
+        os.replace(tmp, sp)
+        if os.path.exists(inbound):
+            shutil.copy2(inbound, os.path.join(vdir, "inbound-log.ts"))
         _, missing = _tg_patch_state(v)
         if missing:
             print("  %s: applied but still missing %s -- inspect by hand"
                   % (v, ", ".join(missing)))
+        elif partial:
+            print("  %s: upgraded from %s (previous patched file kept as server.ts.prev)"
+                  % (v, os.path.basename(orig)))
         else:
             print("  %s: applied (stock kept as server.ts.orig-%s)" % (v, v))
 
