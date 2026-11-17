@@ -1,8 +1,8 @@
---- server.ts.orig-0.0.6	2026-07-24 11:26:01
-+++ server.ts	2026-08-03 14:17:35
-@@ -22,6 +22,14 @@
- import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+--- server.ts.orig-0.0.7
++++ server.ts
+@@ -23,6 +23,14 @@
  import { homedir } from 'os'
+ import { execFileSync } from 'child_process'
  import { join, extname, sep } from 'path'
 +import {
 +  appendInbound,
@@ -13,9 +13,9 @@
 +  saveCursor,
 +} from './inbound-log'
  
- const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
- const ACCESS_FILE = join(STATE_DIR, 'access.json')
-@@ -52,6 +60,18 @@
+ const STATE_DIR = process.env.TELEGRAM_STATE_DIR
+   ?? join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'channels', 'telegram')
+@@ -54,6 +62,18 @@
  }
  const INBOX_DIR = join(STATE_DIR, 'inbox')
  const PID_FILE = join(STATE_DIR, 'bot.pid')
@@ -34,7 +34,7 @@
  
  // Telegram allows exactly one getUpdates consumer per token. If a previous
  // session crashed (SIGKILL, terminal closed) its server.ts grandchild can
-@@ -86,6 +106,10 @@
+@@ -95,6 +115,10 @@
  const bot = new Bot(TOKEN)
  let botUsername = ''
  
@@ -45,7 +45,7 @@
  type PendingEntry = {
    senderId: string
    chatId: string
-@@ -114,6 +138,10 @@
+@@ -123,6 +147,10 @@
    textChunkLimit?: number
    /** Split on paragraph boundaries instead of hard char count. */
    chunkMode?: 'length' | 'newline'
@@ -56,7 +56,7 @@
  }
  
  function defaultAccess(): Access {
-@@ -158,6 +186,8 @@
+@@ -167,6 +195,8 @@
        replyToMode: parsed.replyToMode,
        textChunkLimit: parsed.textChunkLimit,
        chunkMode: parsed.chunkMode,
@@ -65,20 +65,159 @@
      }
    } catch (err) {
      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
-@@ -397,7 +427,7 @@
+@@ -406,7 +436,7 @@
      instructions: [
        'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
        '',
 -      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
-+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. If the tag has reply_to_message_id, the sender quote-replied to an earlier message — reply_to_text is a snippet of that quoted message; use it to understand which message they are responding to. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
++      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. If the tag has thread_id, the sender wrote inside a forum topic — pass the same thread_id to reply so the answer lands in that topic. If the tag has reply_to_message_id, the sender quote-replied to an earlier message — reply_to_text is a snippet of that quoted message; use it to understand which message they are responding to. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
        '',
        'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
        '',
-@@ -641,6 +671,35 @@
- })
+@@ -419,7 +449,23 @@
+ 
+ // Stores full permission details for "See more" expansion keyed by request_id.
+ const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
++// PERM_FANOUT -- crew tgpatch marker. Each permission prompt goes to the main
++// chat AND to the forum topic the user last wrote in (if recent), so it shows
++// up where they are. Every copy is remembered so that answering one -- button
++// or typed "yes xxxxx" -- marks all of them answered and strips their buttons.
++const PERM_TOPIC_FRESH_MS = 30 * 60 * 1000
++let lastTopic: { chat_id: string; thread_id: number; at: number } | null = null
++const permCopies = new Map<string, { chat_id: string; message_id: number; text: string }[]>()
+ 
++async function settlePermission(request_id: string, label: string, skip?: { chat_id: string; message_id: number }): Promise<void> {
++  const copies = permCopies.get(request_id) ?? []
++  permCopies.delete(request_id)
++  for (const c of copies) {
++    if (skip && c.chat_id === skip.chat_id && c.message_id === skip.message_id) continue
++    await bot.api.editMessageText(c.chat_id, c.message_id, `${c.text}\n\n${label}`).catch(() => {})
++  }
++}
++
+ // Receive permission_request from CC → format → send to all allowlisted DMs.
+ // Groups are intentionally excluded — the security thread resolution was
+ // "single-user mode for official plugins." Anyone in access.allowFrom
+@@ -443,10 +489,24 @@
+       .text('See more', `perm:more:${request_id}`)
+       .text('✅ Allow', `perm:allow:${request_id}`)
+       .text('❌ Deny', `perm:deny:${request_id}`)
++    const topic = lastTopic && Date.now() - lastTopic.at < PERM_TOPIC_FRESH_MS ? lastTopic : null
++    const copies: { chat_id: string; message_id: number; text: string }[] = []
++    permCopies.set(request_id, copies)
+     for (const chat_id of access.allowFrom) {
+-      void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
+-        process.stderr.write(`permission_request send to ${chat_id} failed: ${e}\n`)
+-      })
++      const targets: (number | undefined)[] = [undefined]
++      if (topic && topic.chat_id === chat_id) targets.push(topic.thread_id)
++      for (const thread_id of targets) {
++        void bot.api.sendMessage(chat_id, text, {
++          reply_markup: keyboard,
++          ...(thread_id != null ? { message_thread_id: thread_id } : {}),
++        }).then(sent => {
++          // Answered before this send finished: settle the straggler too.
++          if (permCopies.get(request_id) === copies) copies.push({ chat_id, message_id: sent.message_id, text })
++          else void bot.api.editMessageText(chat_id, sent.message_id, `${text}\n\n(answered elsewhere)`).catch(() => {})
++        }).catch(e => {
++          process.stderr.write(`permission_request send to ${chat_id}${thread_id != null ? ` thread ${thread_id}` : ''} failed: ${e}\n`)
++        })
++      }
+     }
+   },
+ )
+@@ -456,7 +516,7 @@
+     {
+       name: 'reply',
+       description:
+-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
++        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, thread_id to post into a forum topic, and files (absolute paths) to attach images or documents.',
+       inputSchema: {
+         type: 'object',
+         properties: {
+@@ -466,6 +526,10 @@
+             type: 'string',
+             description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
+           },
++          thread_id: {
++            type: 'string',
++            description: 'Forum topic to post into. Pass thread_id from the inbound <channel> block to answer in the same topic, or one returned by create_topic. Omit for the main chat.',
++          },
+           files: {
+             type: 'array',
+             items: { type: 'string' },
+@@ -505,6 +569,18 @@
+       },
+     },
+     {
++      name: 'create_topic',
++      description: 'Create a forum topic in an allowlisted chat (a forum supergroup, or the private chat once the bot has topic mode enabled in @BotFather). Returns the thread_id to pass to reply. Create once per subject and reuse the id; do not create a topic per message.',
++      inputSchema: {
++        type: 'object',
++        properties: {
++          chat_id: { type: 'string' },
++          name: { type: 'string', description: 'Topic title, 1-128 characters' },
++        },
++        required: ['chat_id', 'name'],
++      },
++    },
++    {
+       name: 'edit_message',
+       description: 'Edit a message the bot previously sent. Useful for interim progress updates. Edits don\'t trigger push notifications — send a new reply when a long task completes so the user\'s device pings.',
+       inputSchema: {
+@@ -533,6 +609,9 @@
+         const chat_id = args.chat_id as string
+         const text = args.text as string
+         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
++        const thread_id = args.thread_id != null && args.thread_id !== '' ? Number(args.thread_id) : undefined
++        if (thread_id != null && !Number.isInteger(thread_id)) throw new Error(`bad thread_id: ${args.thread_id}`)
++        const threadOpt = thread_id != null ? { message_thread_id: thread_id } : {}
+         const files = (args.files as string[] | undefined) ?? []
+         const format = (args.format as string | undefined) ?? 'text'
+         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
+@@ -562,6 +641,7 @@
+               (replyMode === 'all' || i === 0)
+             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
+               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
++              ...threadOpt,
+               ...(parseMode ? { parse_mode: parseMode } : {}),
+             })
+             sentIds.push(sent.message_id)
+@@ -578,9 +658,12 @@
+         for (const f of files) {
+           const ext = extname(f).toLowerCase()
+           const input = new InputFile(f)
+-          const opts = reply_to != null && replyMode !== 'off'
+-            ? { reply_parameters: { message_id: reply_to } }
+-            : undefined
++          const opts = {
++            ...(reply_to != null && replyMode !== 'off'
++              ? { reply_parameters: { message_id: reply_to } }
++              : {}),
++            ...threadOpt,
++          }
+           if (PHOTO_EXTS.has(ext)) {
+             const sent = await bot.api.sendPhoto(chat_id, input, opts)
+             sentIds.push(sent.message_id)
+@@ -621,6 +704,14 @@
+         writeFileSync(path, buf)
+         return { content: [{ type: 'text', text: path }] }
+       }
++      case 'create_topic': {
++        const chat_id = args.chat_id as string
++        assertAllowedChat(chat_id)
++        const name = String(args.name ?? '').trim().slice(0, 128)
++        if (!name) throw new Error('name is required')
++        const topic = await bot.api.createForumTopic(chat_id, name)
++        return { content: [{ type: 'text', text: `created topic "${topic.name}" (thread_id: ${topic.message_thread_id})` }] }
++      }
+       case 'edit_message': {
+         assertAllowedChat(args.chat_id as string)
+         const editFormat = (args.format as string | undefined) ?? 'text'
+@@ -651,6 +742,35 @@
  
  await mcp.connect(new StdioServerTransport())
-+
+ 
 +// Replay inbound that was logged while no session was attached (the client
 +// crashed, was /reload-plugins'd, or the transport dropped mid-run while this
 +// process kept polling). A fresh server.ts spawns per session, so this runs
@@ -107,15 +246,22 @@
 +} catch (err) {
 +  process.stderr.write(`telegram channel: backlog replay failed: ${err}\n`)
 +}
- 
++
  // When Claude Code closes the MCP connection, stdin gets EOF. Without this
  // the bot keeps polling forever as a zombie, holding the token and blocking
-@@ -786,8 +845,34 @@
+ // the next session with 409 Conflict.
+@@ -789,12 +909,40 @@
+   if (msg && 'text' in msg && msg.text) {
+     await ctx.editMessageText(`${msg.text}\n\n${label}`).catch(() => {})
+   }
++  await settlePermission(request_id, label,
++    msg ? { chat_id: String(msg.chat.id), message_id: msg.message_id } : undefined)
+ })
  
  bot.on('message:text', async ctx => {
    await handleInbound(ctx, ctx.message.text, undefined)
-+})
-+
+ })
+ 
 +// An edit used to be invisible: the session kept the ORIGINAL text forever and
 +// acted on wording the sender had already corrected. Deliver it as its own
 +// inbound, labelled, carrying the id of the message it revises so the reader can
@@ -124,8 +270,8 @@
 +  const m = ctx.editedMessage
 +  if (!m) return
 +  await handleInbound(ctx, `[EDITED message ${m.message_id}] ${m.text ?? ''}`, undefined)
- })
- 
++})
++
 +// Reactions are a real signal — a 👍 on a relay is an answer. Telegram only
 +// sends these if the bot names message_reaction in allowed_updates (see
 +// bot.start below); without that this handler never fires.
@@ -145,7 +291,39 @@
  bot.on('message:photo', async ctx => {
    const caption = ctx.message.caption ?? '(photo)'
    // Defer download until after the gate approves — any user can send photos,
-@@ -960,29 +1045,66 @@
+@@ -926,6 +1074,12 @@
+   const from = ctx.from!
+   const chat_id = String(ctx.chat!.id)
+   const msgId = ctx.message?.message_id
++  // Forum topic the message was posted in (forum supergroups, and private
++  // chats once the bot has topic mode on). ctx.msg also covers edits.
++  // THREAD_PASSTHROUGH -- crew tgpatch marker
++  const threadId = ctx.msg?.is_topic_message ? ctx.msg.message_thread_id : undefined
++  // Reactions carry no topic; only real messages move "where the user is".
++  if (ctx.msg) lastTopic = threadId != null ? { chat_id, thread_id: threadId, at: Date.now() } : null
+ 
+   // Permission-reply intercept: if this looks like "yes xxxxx" for a
+   // pending permission request, emit the structured event instead of
+@@ -940,6 +1094,8 @@
+         behavior: permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
+       },
+     })
++    void settlePermission(permMatch[2]!.toLowerCase(),
++      permMatch[1]!.toLowerCase().startsWith('y') ? '✅ Allowed' : '❌ Denied')
+     if (msgId != null) {
+       const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
+       void bot.api.setMessageReaction(chat_id, msgId, [
+@@ -950,7 +1106,8 @@
+   }
+ 
+   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
+-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
++  void bot.api.sendChatAction(chat_id, 'typing',
++    threadId != null ? { message_thread_id: threadId } : undefined).catch(() => {})
+ 
+   // Ack reaction — lets the user know we're processing. Fire-and-forget.
+   // Telegram only accepts a fixed emoji whitelist — if the user configures
+@@ -967,29 +1124,67 @@
  
    // image_path goes in meta only — an in-content "[image attached — read: PATH]"
    // annotation is forgeable by any allowlisted sender typing that string.
@@ -173,6 +351,7 @@
 +    meta: {
 +      chat_id,
 +      ...(msgId != null ? { message_id: String(msgId) } : {}),
++      ...(threadId != null ? { thread_id: String(threadId) } : {}),
 +      user: from.username ?? String(from.id),
 +      user_id: String(from.id),
 +      ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
@@ -234,7 +413,7 @@
  }
  
  // Without this, any throw in a message handler stops polling permanently
-@@ -1000,6 +1122,16 @@
+@@ -1007,6 +1202,16 @@
    for (let attempt = 1; ; attempt++) {
      try {
        await bot.start({

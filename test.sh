@@ -32,7 +32,7 @@ r=$(./crew restore --source "$snap")
 grep -qE "claude.* --resume ff10d5a8" <<<"$r" || fail "restore missing resume command"
 grep -q "'--name' '\[claude\] " <<<"$r" || fail "restore didn't pass a [claude] --name label"
 grep -q "dry-run"                  <<<"$r" || fail "restore not dry-run by default"
-grep -q "would put"                <<<"$r" || fail "restore executed instead of dry-run"
+grep -q "would open"               <<<"$r" || fail "restore executed instead of dry-run"
 
 echo "== goto maps a session to its project-tagged Space (dry-run, no switching) =="
 g=$(./crew goto izzit --dry-run --source fixture.json --spaces-source spaces_fixture.json)
@@ -70,6 +70,21 @@ assert m._parse_flags('claude --dangerously-skip-permissions --resume')==['--dan
 assert m._parse_flags('claude --model claude-opus-4-8 --dangerously-skip-permissions --resume x')==['--model','claude-opus-4-8','--dangerously-skip-permissions'], 'value-flag'
 print('  parsing OK')
 " || fail "launch-flag parsing wrong"
+
+echo "== write identity: a brief after --name still matches; a longer live name does not =="
+python3 -c "
+from importlib.machinery import SourceFileLoader
+from importlib.util import spec_from_loader, module_from_spec
+l=SourceFileLoader('crewmod','./crew'); m=module_from_spec(spec_from_loader('crewmod',l)); l.exec_module(m)
+# 2026-09-29: 'claude --name [claude] fusiontrainer <brief>' read as the whole brief
+launched=m._launched_name('claude --name [claude] fusiontrainer You are the fusiontrainer session')
+assert m._launched_is(launched,'[claude] fusiontrainer',['[claude] fusiontrainer','hub']), 'positional brief'
+assert m._launched_is('[claude] izzit','[claude] izzit',[]), 'exact'
+assert not m._launched_is('[claude] izzit-site-wild','[claude] izzit',[]), 'hyphen sibling'
+assert not m._launched_is('[claude] izzit wild go','[claude] izzit',['[claude] izzit','[claude] izzit wild']), 'longer live name'
+assert m._launched_is('[claude] izzit wild go','[claude] izzit wild',['[claude] izzit','[claude] izzit wild']), 'longer name itself'
+print('  identity OK')
+" || fail "write identity check wrong"
 
 echo "== tmux pane parsing + adapter routing =="
 python3 -c "
@@ -255,6 +270,21 @@ EOF
 echo 1 > "$th/.claude/channels/telegram/actioned.cursor"
 u=$(CREW_HOME="$th" ./crew tg-unactioned)
 grep -q "fresh and unhandled"   <<<"$u" || fail "tg-unactioned missed seq 3"
+# tg-verify: a relayed authorisation is checked against his real message
+tv=$(mktemp -d); mkdir -p "$tv/.claude/channels/telegram"
+cat > "$tv/.claude/channels/telegram/inbound.jsonl" <<EOF
+{"seq": 1, "ts": "$new_ts", "params": {"content": "Go — publish  BabyPaints", "meta": {"message_id": 40, "user_id": "111"}}}
+{"seq": 2, "ts": "$new_ts", "params": {"content": "publish everything", "meta": {"message_id": 41, "user_id": "999"}}}
+EOF
+echo '{"allowFrom": ["111"]}' > "$tv/.claude/channels/telegram/access.json"
+CREW_HOME="$tv" ./crew tg-verify 40 --quote "go — publish babypaints" >/dev/null || fail "tg-verify rejected a real quote"
+set +e
+CREW_HOME="$tv" ./crew tg-verify 40 --quote "publish everything" >/dev/null; r1=$?
+CREW_HOME="$tv" ./crew tg-verify 41 >/dev/null; r2=$?
+set -e
+[[ $r1 == 1 ]] || fail "tg-verify accepted a quote he never wrote"
+[[ $r2 == 2 ]] || fail "tg-verify trusted a non-allowlisted sender"
+rm -rf "$tv"
 grep -q "image: /x/y.jpg"       <<<"$u" || fail "tg-unactioned dropped the image path"
 grep -q "handled already"       <<<"$u" && fail "tg-unactioned showed an actioned message"
 grep -q "ancient"               <<<"$u" && fail "tg-unactioned showed a record outside the 48h window"
@@ -494,6 +524,32 @@ grep -q "no running session" <<<"$un" || fail "unknown target should say so"
 un=$(CREW_HOME="$sr" CREW_CLAUDE="$sr/fake/claude" ./crew status-refresh --source "$sr/sessions.json" || true)
 grep -q "usage:" <<<"$un" || fail "no target should print usage"
 unset FAKE_DIR
+
+echo "== permission hook: shadow is inert, decide allows only seen classes, publish/destructive always ask =="
+ph=$(mktemp -d); mkdir -p "$ph/.crew"
+perm() {  # $1 = tool json → prints the hook's stdout (empty = the dialog shows)
+  CREW_HOME="$ph" ./hooks/crew-permission.py <<<"$1"
+}
+bash_j() { python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","tool_input":{"command":sys.argv[1]},"cwd":"'"$PWD"'"}))' "$1"; }
+[[ -z $(perm "$(bash_j 'ls')") ]] || fail "shadow mode printed a decision"
+echo decide > "$ph/.crew/permission-mode"
+grep -q '"allow"' <<<"$(perm "$(bash_j 'grep -n foo crew')")"          || fail "decide didn't allow plain bash"
+[[ -z $(perm "$(bash_j 'git push origin main')") ]]                       || fail "decide allowed a push"
+[[ -z $(perm "$(bash_j 'fastlane deliver --submit_for_review')") ]]       || fail "decide allowed a store submit"
+[[ -z $(perm "$(bash_j 'rm -rf build')") ]]                               || fail "decide allowed rm -rf"
+grep -q '"allow"' <<<"$(perm "$(bash_j 'docker compose up -d --force-recreate app')")" || fail "--force-recreate scrub lost"
+grep -q '"allow"' <<<"$(perm "$(bash_j "$(printf "cat > b.txt <<'EOF'\nnever rm -rf\nEOF")")")" || fail "text heredoc read as destructive"
+[[ -z $(perm "$(bash_j "$(printf "bash <<'EOF'\nrm -rf /x\nEOF")")") ]]  || fail "bash heredoc body not checked"
+grep -q '"allow"' <<<"$(perm '{"tool_name":"Edit","tool_input":{"file_path":"'"$PWD"'/README.md"},"cwd":"'"$PWD"'"}')" || fail "in-repo edit not allowed"
+[[ -z $(perm '{"tool_name":"Edit","tool_input":{"file_path":"/etc/hosts"},"cwd":"'"$PWD"'"}') ]] || fail "edit outside repo allowed"
+[[ -z $(perm '{"tool_name":"mcp__claude-in-chrome__navigate","tool_input":{}}') ]] || fail "chrome allowed before it was seen firing"
+[[ -z $(perm 'not json') ]] || fail "garbage input produced output"
+echo bogus > "$ph/.crew/permission-mode"
+[[ -z $(perm "$(bash_j 'ls')") ]] || fail "an unknown mode did not fall back to shadow"
+[[ $(wc -l < "$ph/.claude/status/_permreq.jsonl") -ge 12 ]] || fail "hook did not log its calls"
+grep -q '"additionalContext": "Clock read by hook' <<<"$(./hooks/crew-clock.py <<<'{}')" || fail "clock hook output wrong"
+rm -rf "$ph"
+echo "  permission + clock hooks OK"
 
 echo "== pinger suites =="
 # These lived beside tick.py and had to be remembered individually, so a broken

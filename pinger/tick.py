@@ -19,7 +19,7 @@ transcript heuristics stay for every session that predates them.
 Sends one batched message per tick to every paired Telegram chat, straight
 through the bot API — independent of the hub session.
 """
-import calendar, difflib, json, os, re, subprocess, sys, time, urllib.request, urllib.parse
+import calendar, difflib, json, os, re, subprocess, sys, time, urllib.error, urllib.request, urllib.parse
 
 HOME        = os.path.expanduser("~")
 CLAUDE      = "/Users/kaolin/.local/bin/claude"
@@ -46,6 +46,12 @@ STATUS_QUEUE   = f"{STATUS_DIR}/_pinger.jsonl"
 # --- tunables ---------------------------------------------------------------
 NOTIFY_FINISHED   = True
 NOTIFY_STUCK      = True
+TG_FINISHED_PAGES = False      # kaolin 2026-11-07 ("this is a lot of noise", #9549, "all" #9553):
+                               # the hub forwards each finished report itself, so the pinger's
+                               # copy doubled every message. Still queued for `crew brief`.
+WAITING_PAGE_SECS = 20 * 60    # same ruling: a permission prompt pages him only if it is STILL
+                               # blocked this long; the hub clears routine ones in minutes.
+                               # Questions ("needs your answer") page at once, as before.
 NOTIFY_WAITING    = True       # session blocked on a question/permission prompt -> ping
                                # (it never un-blocks on its own; silence = lost hours)
 MIN_FINISHED_SECS = 120        # only ping "finished" for busy episodes >= this
@@ -61,6 +67,11 @@ NOTIFY_STALLED    = True       # the opposite blind spot: a session sitting IDLE
 STALLED_MINS      = 30.0       # idle this long WITH open notes -> ping once
 HUBNOTES_LEDGER   = f"{HOME}/.claude/status/_hubnotes.jsonl"
 EXCLUDE_NAMES     = {"hub"}     # sessions to never ping about (the hub itself)
+OWN_SESSION_PREFIXES = ("kaolin-",)  # kaolin's OWN interactive sessions (kaolin-40/-cc/-7a):
+                               # he sits AT them, so a "blocked on a permission prompt" page is
+                               # pure noise — he answers it on the spot (2026-09-27, "meaningless
+                               # noise?"). Treated like approver-covered for the permission/consent
+                               # alert; a real question ("needs your answer") still goes through.
 # Sessions whose permission prompts an approver script answers (the hub keeps
 # this list). A "blocked on a permission prompt" for one of these is not news
 # for kaolin: Chrome consent asks on every browser step, and each one used to
@@ -91,6 +102,14 @@ ARTIFACT_SLACK    = 300        # secs before busy_since a file may have been wri
 TAIL_LINES        = 400       # transcript lines to scan for artifact paths (episode-filtered)
 IMG_RE            = re.compile(r"/[^\s\"'`<>()\[\],]+\.(?:png|jpg|jpeg|gif)", re.I)
 TG_LIMIT          = 3900       # Telegram hard-caps sendMessage at 4096; leave headroom
+TG_APP_TOPICS     = True       # forum topics in the bot DM (kaolin #9970, 2026-11-15): one
+                               # per session (#10008, 2026-11-16), keyed and titled by its
+                               # display name, created on first use.
+                               # Off, or topics unavailable -> everything to the main chat as before.
+TOPIC_ALSO_MAIN   = {"🔐", "🙋"}  # pages that need him ALSO go to the main chat ("just in case")
+TOPICS_PATH       = os.path.join(HOME, ".claude", "status", "tg-topics.json")
+TOPIC_TITLES      = {"tgthreads": "Threads"}  # session -> topic title, when he wants
+                                              # another name (kaolin #10056)
 # ----------------------------------------------------------------------------
 
 
@@ -164,19 +183,126 @@ def usable_sessions(rows):
     return good, skipped
 
 
-def send(token, chat, text, parse_mode=None):
+class TopicGone(Exception):
+    """The forum topic a send targeted no longer exists (he deleted it)."""
+
+
+def _topic_gone(err):
+    e = (err or "").lower()
+    return "thread not found" in e or "topic_deleted" in e or "topic_closed" in e
+
+
+def _http_error_text(e):
+    try:
+        return json.loads(e.read().decode()).get("description") or str(e)
+    except Exception:                           # noqa: BLE001
+        return str(e)
+
+
+def send(token, chat, text, parse_mode=None, thread_id=None):
     fields = {"chat_id": chat, "text": text}
     if parse_mode:
         fields["parse_mode"] = parse_mode
+    if thread_id is not None:
+        fields["message_thread_id"] = str(thread_id)
     data = urllib.parse.urlencode(fields).encode()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=20) as r:
             r.read()
         return True
+    except urllib.error.HTTPError as e:
+        err = _http_error_text(e)
+        log(f"send to {chat}{f' thread {thread_id}' if thread_id is not None else ''} failed: {err}")
+        if thread_id is not None and _topic_gone(err):
+            raise TopicGone(err)
+        return False
     except Exception as e:                      # noqa: BLE001
         log(f"send to {chat} failed: {e}")
         return False
+
+
+def load_topics():
+    """{chat_id: {session display name: thread_id}} -- shared with the hub,
+    which reads it to know which session a topic belongs to."""
+    try:
+        with open(TOPICS_PATH) as f:
+            t = json.load(f)
+        return t if isinstance(t, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_topics(topics):
+    tmp = TOPICS_PATH + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(TOPICS_PATH), exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(topics, f, indent=1, sort_keys=True)
+        os.replace(tmp, TOPICS_PATH)
+    except OSError as e:
+        log(f"could not save {TOPICS_PATH}: {e}")
+
+
+def create_topic(token, chat, name):
+    """createForumTopic -> thread id, or None (topic mode off, API error).
+    A plain send-side call: it does not touch getUpdates."""
+    data = urllib.parse.urlencode({"chat_id": chat, "name": name[:128]}).encode()
+    url = f"https://api.telegram.org/bot{token}/createForumTopic"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=20) as r:
+            res = json.loads(r.read().decode())
+        tid = (res.get("result") or {}).get("message_thread_id")
+        return int(tid) if tid is not None else None
+    except urllib.error.HTTPError as e:
+        log(f"createForumTopic {name!r} in {chat} failed: {_http_error_text(e)}")
+    except Exception as e:                      # noqa: BLE001
+        log(f"createForumTopic {name!r} in {chat} failed: {e}")
+    return None
+
+
+def topic_for(token, chat, app, topics):
+    """Thread id for this app's topic, creating it on first use; None means
+    send to the main chat."""
+    if not TG_APP_TOPICS or not app:
+        return None
+    mine = topics.setdefault(str(chat), {})
+    if app in mine:
+        return mine[app]
+    tid = create_topic(token, chat, TOPIC_TITLES.get(app, app))
+    if tid is not None:
+        mine[app] = tid
+        save_topics(topics)
+        log(f"created topic {app!r} in {chat}: thread {tid}")
+    return tid
+
+
+def deliver_app_page(token, chat, kind, app, md_parts, plain_parts, photos,
+                     caption, topics):
+    """One app's page: into its topic; pages that need him (TOPIC_ALSO_MAIN)
+    also to the main chat. No topic (mode off, create failed, deleted) = main
+    chat only, as before topics. Returns photos sent."""
+    tid = topic_for(token, chat, app, topics)
+    if tid is not None:
+        try:
+            send_chunked(token, chat, md_parts, plain_parts,
+                         header="", prepacked=True, thread_id=tid)
+        except TopicGone:
+            forget_topic(chat, app, topics)
+            tid = None
+    if tid is None or kind in TOPIC_ALSO_MAIN:
+        send_chunked(token, chat, md_parts, plain_parts, header="", prepacked=True)
+    n = 0
+    for p in photos:
+        send_photo(token, chat, p, caption, thread_id=tid)
+        n += 1
+    return n
+
+
+def forget_topic(chat, app, topics):
+    if topics.get(str(chat), {}).pop(app, None) is not None:
+        save_topics(topics)
+        log(f"topic for {app!r} in {chat} is gone; forgot it")
 
 
 _MD_SPECIAL = r"_*[]()~`>#+-=|{}.!"
@@ -207,7 +333,7 @@ def pack(blocks, header="🔔 crew"):
 
 
 def send_chunked(token, chat, blocks_md, blocks_plain, header="🔔 crew",
-                 prepacked=False):
+                 prepacked=False, thread_id=None):
     """Send MarkdownV2 blocks; if the first message is rejected (an escaping bug
     would 400), fall back to plain text for the whole batch so a formatting
     error degrades gracefully instead of dropping the report (kaolin wants
@@ -216,15 +342,15 @@ def send_chunked(token, chat, blocks_md, blocks_plain, header="🔔 crew",
     — send as-is instead of re-grouping."""
     md = blocks_md if prepacked else pack(blocks_md, header)
     for i, m in enumerate(md):
-        if send(token, chat, m, parse_mode="MarkdownV2"):
+        if send(token, chat, m, parse_mode="MarkdownV2", thread_id=thread_id):
             continue
         if i == 0:                                     # bad markup → plain for all
             log("markdownv2 send rejected; falling back to plain")
             ok = True
             for pm in (blocks_plain if prepacked else pack(blocks_plain, header)):
-                ok = send(token, chat, pm) and ok
+                ok = send(token, chat, pm, thread_id=thread_id) and ok
             return ok
-        send(token, chat, m)                           # later msg: retry unformatted
+        send(token, chat, m, thread_id=thread_id)      # later msg: retry unformatted
     return True
 
 
@@ -281,6 +407,13 @@ def approver_covered():
             return {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
     except OSError:
         return set()
+
+
+def is_own_session(name):
+    """kaolin's own interactive sessions — he watches them directly, so their
+    permission prompts are not news (2026-09-27)."""
+    dn = display_name(name)
+    return any(dn.startswith(p) for p in OWN_SESSION_PREFIXES)
 
 
 def hub_delivered(lines, shots):
@@ -873,7 +1006,7 @@ def find_artifacts(path, since, cap=MAX_ARTIFACTS):
     return found[-cap:]
 
 
-def send_photo(token, chat, path, caption=""):
+def send_photo(token, chat, path, caption="", thread_id=None):
     boundary = "----crewpinger" + str(int(time.time() * 1000))
     try:
         with open(path, "rb") as f:
@@ -881,7 +1014,8 @@ def send_photo(token, chat, path, caption=""):
     except OSError:
         return False
     parts = []
-    for key, val in (("chat_id", str(chat)), ("caption", caption[:1024])):
+    for key, val in (("chat_id", str(chat)), ("caption", caption[:1024]),
+                     ("message_thread_id", "" if thread_id is None else str(thread_id))):
         if val:
             parts.append(
                 f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{val}\r\n".encode()
@@ -1148,8 +1282,56 @@ def check_poller(now, state):
     return already, dead_since
 
 
+LOGIN_WARN_SECS = (72 * 3600, 24 * 3600, 0)   # alert at 3 days, 1 day, expired
+
+
+def login_expires_at():
+    """Epoch seconds when the claude.ai login expires, or None if unknown."""
+    try:
+        out = subprocess.run([os.path.expanduser("~/.local/bin/claude"), "auth", "status"], capture_output=True,
+                             text=True, timeout=30).stdout
+        raw = json.loads(out).get("loginExpiresAt")
+        if not raw:
+            return None
+        from datetime import datetime
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except Exception as e:                      # noqa: BLE001
+        log(f"login expiry check failed: {e}")
+        return None
+
+
+def check_login_expiry(now, state):
+    """Telegram heads-up before the claude.ai login hits its time limit, so the
+    hub doesn't go dark. One alert per threshold, re-armed when the expiry moves
+    (i.e. after a fresh /login). Returns the state dict for 'login_alert'."""
+    prev = state.get("login_alert") or {}
+    exp = login_expires_at()
+    if exp is None:
+        return prev
+    if prev.get("expires") != exp:
+        prev = {"expires": exp, "level": -1}          # new login: re-arm
+    left = exp - now
+    level = max((i for i, t in enumerate(LOGIN_WARN_SECS) if left <= t), default=-1)
+    if level > prev.get("level", -1):
+        hrs = left / 3600
+        when = "has EXPIRED" if left <= 0 else f"expires in {hrs:.0f}h"
+        msg = (f"🔑 Claude login {when} — hub and workers will stop working. "
+               "Run /login in the hub (type `! claude auth login` if needed).")
+        token, chats = load_token(), load_chats()
+        ok = all(send(token, c, msg) for c in chats) if chats else False
+        log(f"LOGIN-EXPIRY alert level={level} left={hrs:.1f}h ok={ok}")
+        if ok:
+            prev["level"] = level
+    return prev
+
+
 def main():
     now = time.time()
+
+    if "--login-check" in sys.argv:
+        exp = login_expires_at()
+        print("loginExpiresAt epoch:", exp, "hours left:", None if exp is None else round((exp - now) / 3600, 1))
+        return
 
     if "--preview" in sys.argv:
         # Dry run: show the message each currently-idle session WOULD produce.
@@ -1185,6 +1367,7 @@ def main():
     state["tunnel_alerted"] = tunnel_alerted
     state["poller_alerted"] = poller_alerted
     actioned_stall_alerted = check_actioned_stall(now, state)     # delivered-but-unactioned (review #5)
+    state["login_alert"] = check_login_expiry(now, state)         # claude.ai login near its time limit
 
     sessions = get_sessions()
     if sessions is None:
@@ -1320,6 +1503,7 @@ def main():
                 # for the wording.
                 pend = hook_pending(notify_ev, pend)
             notified = bool(p.get("notified_waiting"))
+            waiting_since = p.get("waiting_since") or now
             if (NOTIFY_WAITING and not notified and not first_run
                     and name not in EXCLUDE_NAMES):
                 detail = pend[1] if pend else ""
@@ -1341,20 +1525,27 @@ def main():
                     glyph, what = "🙋", "needs your answer"
                 else:
                     glyph, what = "🔐", "blocked on a permission prompt"
+                hold_page = glyph == "🔐" and (now - waiting_since) < WAITING_PAGE_SECS
                 # A Claude-in-Chrome consent lists numbered options, so the
                 # heuristic above files it as a "question"; it is still a
                 # permission prompt the approver answers.
                 chrome_consent = "Claude in Chrome wants to" in (detail or "")
-                if name in approver_covered() and (glyph == "🔐" or chrome_consent):
-                    log(f"{name}: permission prompt, approver-covered; not paging")
+                if hold_page:
+                    log(f"{name}: permission prompt for {(now - waiting_since) / 60:.0f}m; "
+                        f"holding the page until {WAITING_PAGE_SECS // 60}m")
+                elif (name in approver_covered() or is_own_session(name)) and (glyph == "🔐" or chrome_consent):
+                    reason = "own session" if is_own_session(name) else "approver-covered"
+                    log(f"{name}: permission prompt, {reason}; not paging")
                 else:
                     body = _clean(detail) if detail else [(False, "run: crew pending")]
                     events.append((glyph, name, proj, what, body, []))
-                notified = True
+                if not hold_page:
+                    notified = True
             new[sid] = {"name": name, "cwd": s.get("cwd"), "status": status,
                         "stalled_sig": p.get("stalled_sig"),
                         "busy_since": p.get("busy_since"), "notified_stuck": False,
                         "notified_waiting": notified,
+                        "waiting_since": waiting_since,
                         "hook_seen": hook_seen}
         else:  # idle
             finished = (p.get("status") == "busy" and bool(p.get("busy_since"))
@@ -1440,6 +1631,7 @@ def main():
                 "tunnel_alerted": tunnel_alerted,
                 "poller_alerted": poller_alerted,
                 "actioned_stall_alerted": actioned_stall_alerted,
+                "login_alert": state.get("login_alert"),
                 "poller_dead_since": poller_dead_since})
 
     # Queue FIRST, and regardless of quiet hours or send success — the queue is
@@ -1457,11 +1649,14 @@ def main():
         stamp = time.strftime("%H:%M", time.localtime(now))
         nshots = 0
         skipped = [n for _, n, _, _, l, ps in events if hub_delivered(l, ps)]
+        topics = load_topics()
         for c in chats:
             # One message PER APP (not one batched "crew" blob), each self-headed
             # with source + a visible timestamp: "✅ babypaints-08 (BabyPaints) · 08:15 · finished…"
             for kind, name, proj, extra, lines, ps in events:
                 if hub_delivered(lines, ps):
+                    continue
+                if kind == "✅" and not TG_FINISHED_PAGES:
                     continue
                 hl = headlines.get(name) or ""
                 tail = f" · {hl}" if hl else ""
@@ -1470,13 +1665,13 @@ def main():
                 head_md = (f"{kind} *{md_escape(shown)}* \\({md_escape(proj)}\\) · "
                            f"{md_escape(stamp)} · {md_escape(extra)}"
                            + (f" · {md_escape(hl)}" if hl else ""))
-                send_chunked(token, c,
-                             split_report(head_md, lines, escape=True),
-                             split_report(head_plain, lines),
-                             header="", prepacked=True)
-                for p in ps:
-                    send_photo(token, c, p, head_plain)
-                    nshots += 1
+                # One topic per SESSION, titled with its phone-facing name
+                # (kaolin #10008: "One topic per session").
+                nshots += deliver_app_page(
+                    token, c, kind, shown,
+                    split_report(head_md, lines, escape=True),
+                    split_report(head_plain, lines),
+                    ps, head_plain, topics)
         log(f"sent {len(events) - len(skipped)} per-app msg(s), {nshots} photo(s) to {len(chats)} chat(s): "
             f"{[n for _, n, _, _, l, ps in events if not hub_delivered(l, ps)]}"
             + (f"; hub-delivered, not sent: {skipped}" if skipped else ""))
