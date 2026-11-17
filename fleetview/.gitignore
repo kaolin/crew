@@ -1,0 +1,7 @@
+# The scripts are the machine; what they produce is a snapshot of his fleet
+# (session names, private repos, store status, activity) -- residue. See
+# ../hub/.gitignore for the rule.
+fleet.json
+fleet.html
+fleet.artifact.html
+*.png

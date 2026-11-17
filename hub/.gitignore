@@ -39,3 +39,17 @@ assemble-cheat.py
 # exists they are noise, and in a public repo they are confusing noise.
 *.bak-*
 *.prev-*
+
+# approver singleton locks (fast-approve-hubroute.sh), runtime state like the logs
+fast-approve-*.lock/
+
+# The open-decisions ledger the /next skill reads: his pending calls on his
+# apps, with his verbatim answers. Pure residue of the work, not the machine.
+decisions.md
+
+# Photos and screenshots relayed to his phone from worker sessions -- frames of
+# unreleased apps.
+relay/
+
+# Runtime switch file (present = relay gate on). State, not tooling.
+relaygate-on

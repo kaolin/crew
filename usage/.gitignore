@@ -1,2 +1,6 @@
 sampler.log
 sampler.err.log
+
+# Hand-rolled backups -- git history is the backup (same rule as hub/.gitignore).
+*.bak-*
+*.pre-refresh-*
