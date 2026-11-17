@@ -106,7 +106,9 @@ TG_APP_TOPICS     = True       # forum topics in the bot DM (kaolin #9970, 2026-
                                # per session (#10008, 2026-11-16), keyed and titled by its
                                # display name, created on first use.
                                # Off, or topics unavailable -> everything to the main chat as before.
-TOPIC_ALSO_MAIN   = {"🔐", "🙋"}  # pages that need him ALSO go to the main chat ("just in case")
+TOPIC_ALSO_MAIN   = {"🙋"}        # pages that ALSO go to the main chat. 🔐 dropped 2026-11-17:
+                               # the copy doubled every permission page (kaolin #10232/#10242,
+                               # "surfacing more than you should" / "permission prompts").
 TOPICS_PATH       = os.path.join(HOME, ".claude", "status", "tg-topics.json")
 TOPIC_TITLES      = {"tgthreads": "Threads"}  # session -> topic title, when he wants
                                               # another name (kaolin #10056)

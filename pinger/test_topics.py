@@ -121,13 +121,20 @@ def test_known_topic_is_reused():
     check("page went to the known topic", api.sends() == [("55", "*md* page")], api.sends())
 
 
-def test_permission_page_goes_to_topic_and_main():
+def test_question_page_goes_to_topic_and_main():
     fresh_topics_file()
-    for kind in ("🔐", "🙋"):
-        api = FakeAPI()
-        run(api, kind=kind, topics={"111222333": {"BabyPaints": 55}})
-        check(f"{kind} page in topic AND main chat",
-              api.sends() == [("55", "*md* page"), (None, "*md* page")], api.sends())
+    api = FakeAPI()
+    run(api, kind="🙋", topics={"111222333": {"BabyPaints": 55}})
+    check("🙋 page in topic AND main chat",
+          api.sends() == [("55", "*md* page"), (None, "*md* page")], api.sends())
+
+
+def test_permission_page_goes_to_topic_only():
+    fresh_topics_file()
+    api = FakeAPI()
+    run(api, kind="🔐", topics={"111222333": {"BabyPaints": 55}})
+    check("🔐 page in its topic only (no main-chat copy)",
+          api.sends() == [("55", "*md* page")], api.sends())
 
 
 def test_create_failure_falls_back_to_main():

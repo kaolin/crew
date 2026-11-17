@@ -3328,6 +3328,53 @@ def _tg_chats():
         return []
 
 
+def _pinger_module():
+    """pinger/tick.py as a module, so topic lookup has ONE implementation."""
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(globals().get("__file__") or sys.argv[0]))
+    spec = importlib.util.spec_from_file_location(
+        "crew_pinger_tick", os.path.join(here, "pinger", "tick.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def cmd_tg_topic(a):
+    """Thread id of a session's Telegram topic, from the shared map
+    (~/.claude/status/tg-topics.json), creating and registering it if missing.
+
+    The pinger and the hub must agree on one topic per session; when the hub
+    created topics on its own (create_topic) and the pinger later created its
+    own for the same session, he got 'hub' vs 'general' and 'spacetag' vs
+    'spacetags' (2026-11-17). Everything goes through this map instead.
+    --set ID registers an existing topic without creating one."""
+    tick = _pinger_module()
+    chats = _tg_chats()
+    if not chats:
+        print("no allowlisted chat"); sys.exit(1)
+    chat = a.chat or chats[0]
+    name = tick.display_name(a.session)
+    topics = tick.load_topics()
+    if a.set is not None:
+        topics.setdefault(str(chat), {})[name] = int(a.set)
+        tick.save_topics(topics)
+        print(a.set)
+        return
+    known = topics.get(str(chat), {}).get(name)
+    if known is not None or a.no_create:
+        if known is None:
+            print("no topic for %s" % name); sys.exit(1)
+        print(known)
+        return
+    token = _tg_token()
+    if not token:
+        print("no bot token"); sys.exit(1)
+    tid = tick.topic_for(token, chat, name, topics)
+    if tid is None:
+        print("could not create a topic for %s (see pinger.log)" % name); sys.exit(1)
+    print(tid)
+
+
 def cmd_escalate(a):
     """Page kaolin that a prompt would not clear — the approver's dead-man switch.
 
@@ -3500,6 +3547,13 @@ def main():
     ptv.add_argument("message_id")
     ptv.add_argument("--quote", help="the exact words the relay attributed to him")
     ptv.set_defaults(fn=cmd_tg_verify)
+    ptt = sub.add_parser("tg-topic",
+        help="thread id of a session's Telegram topic (shared map; created if missing)")
+    ptt.add_argument("session", help="session name, e.g. hub or '[claude] spacetag'")
+    ptt.add_argument("--set", metavar="THREAD_ID", help="register an existing topic, don't create")
+    ptt.add_argument("--no-create", action="store_true", help="only look up")
+    ptt.add_argument("--chat", help="chat id (default: first allowlisted)")
+    ptt.set_defaults(fn=cmd_tg_topic)
     pb = sub.add_parser("brief",
         help="wake briefing: every session's status file + unseen pinger events")
     pb.add_argument("--plain", action="store_true", help="no ANSI colour")

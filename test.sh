@@ -349,6 +349,15 @@ CREW_HOME="$th" ./crew brief --plain >/dev/null
 CREW_HOME="$th" ./crew brief --plain | grep -q "you have not seen" && fail "acked events must not repeat"
 # tg-patch with no plugin installed must not crash
 CREW_HOME="$th" ./crew tg-patch >/dev/null 2>&1 || fail "tg-patch errored with no plugin dir"
+# tg-topic: one shared session->topic map; --set registers, lookup strips the
+# "[claude] " prefix, --no-create never calls Telegram. HOME too: the pinger
+# module resolves the map from ~.
+mkdir -p "$th/.claude/channels/telegram"
+echo '{"allowFrom":["111222333"]}' > "$th/.claude/channels/telegram/access.json"
+HOME="$th" CREW_HOME="$th" ./crew tg-topic "[claude] spacetag" --set 16450 >/dev/null
+[[ $(HOME="$th" CREW_HOME="$th" ./crew tg-topic spacetag --no-create) == 16450 ]] || fail "tg-topic lookup after --set"
+HOME="$th" CREW_HOME="$th" ./crew tg-topic other --no-create >/dev/null && fail "tg-topic --no-create invented a topic"
+grep -q '"spacetag": 16450' "$th/.claude/status/tg-topics.json" || fail "tg-topic did not write the shared map"
 rm -rf "$th"
 
 echo "== hooks: install prints the JSON and refuses without --yes; --yes is idempotent; uninstall is surgical =="
