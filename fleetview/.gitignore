@@ -5,3 +5,4 @@ fleet.json
 fleet.html
 fleet.artifact.html
 *.png
+.cache.json
