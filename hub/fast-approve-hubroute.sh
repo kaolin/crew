@@ -24,12 +24,38 @@ NAME="$1"; MINUTES="${2:-25}"
 # it into a '_' and every log was really fast-approve-<name>_.log. That is not
 # cosmetic -- the hub looked for the un-suffixed name, found nothing, and reported
 # an approver's log as empty when it was several hundred lines long (2026-09-29).
-LOG=/Users/kaolin/.crew/hub/fast-approve-$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9' '_').log
+SLUG=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9' '_')
+LOG=/Users/kaolin/.crew/hub/fast-approve-$SLUG.log
 MAXFAIL=3
+
+# ONE approver per session, enforced here rather than by whoever counts `ps`.
+# On 2026-09-29 eight ran against nandgame, and two `down enter` sequences
+# landing together picked "3. No", a rejection kaolin never made. The hub
+# miscounted three different ways (PPID==1, parent command text, and matching
+# its own prompt text). A lock makes the count irrelevant. mkdir is atomic.
+# A lock left by a dead pid is taken over. Exit 4 means "already covered".
+LOCK=/Users/kaolin/.crew/hub/fast-approve-$SLUG.lock
+if ! mkdir "$LOCK" 2>/dev/null; then
+  other=$(cat "$LOCK/pid" 2>/dev/null)
+  if [ -n "$other" ] && kill -0 "$other" 2>/dev/null; then
+    echo "approver for '$NAME' already running (pid $other); not starting a second" >&2
+    exit 4
+  fi
+  rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null
+  mkdir "$LOCK" 2>/dev/null || { echo "could not take $LOCK" >&2; exit 4; }
+fi
+echo $$ > "$LOCK/pid"
+trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null' EXIT
+trap 'exit 130' INT TERM HUP
 
 DESTRUCTIVE='rm +-[rf]|--force|force-with-lease|reset +--hard|--hard|git +clean|git +checkout +--|git +restore|erase|deleteall|drop +table|truncate|git +push|push +origin|push +-|devicectl device (erase|uninstall)|xcrun simctl (erase|delete)|launchctl (bootout|unload)|defaults +delete|security +delete|shutdown|reboot|diskutil|mkfs|dd +if=|dd +of=|(^|[^a-z])sudo '
 
-fail=0; esc_sig=""; n=0
+# One counter per failure kind. A single shared `fail` once escalated
+# "approved 3 times but prompt won't clear" at NO-CLEAR(25/3): one real
+# no-clear on top of 24 UNRECOGNIZED (nandgame, 2026-09-29 07:16). The alert
+# named the wrong failure.
+f_unrec=0; f_noclear=0; f_send=0; esc_sig=""; n=0
+reset_fails() { f_unrec=0; f_noclear=0; f_send=0; }
 end=$(( $(date +%s) + MINUTES*60 ))
 
 classify() {
@@ -115,29 +141,35 @@ is_destructive() {
     | grep -qiE "$DESTRUCTIVE"
 }
 
+# crew keys' own output is KEPT. It used to go to /dev/null, and on 2026-09-29/30
+# that discarded "not reachable — window/pid moved" on 4,144 consecutive
+# attempts against fusiontrainer. That line named the real fault (a --name
+# parse bug in crew), and nobody saw it for 13 hours.
 approve() {   # $1=keys $2=sig $3=label $4=cmd-for-log
-  if "$CREW" keys --force "$NAME" $1 >/dev/null 2>&1; then
+  kout=$("$CREW" keys --force "$NAME" $1 2>&1); rc=$?
+  if [ "$rc" -eq 0 ]; then
     sleep 4
     st=$("$CREW" status 2>&1 | grep -F " $NAME " | grep -oE "waiting|busy|idle" | head -1)
     if [ "$st" = "waiting" ]; then
       nkd=$(classify "$NAME"); nsig="$(printf '%s\n' "$nkd" | sed -n 1p)|$(printf '%s\n' "$nkd" | sed -n 2p)"
       if [ "$nsig" = "$2" ]; then
-        fail=$((fail+1)); echo "$(date +%H:%M:%S) NO-CLEAR($fail/$MAXFAIL) [$3]: still waiting on same prompt" >> "$LOG"
-        [ "$fail" -ge "$MAXFAIL" ] && escalate_once "$2" "approved $MAXFAIL times but prompt won't clear — keystrokes not landing?"
+        f_noclear=$((f_noclear+1)); echo "$(date +%H:%M:%S) NO-CLEAR($f_noclear/$MAXFAIL) [$3]: still waiting on same prompt" >> "$LOG"
+        [ "$f_noclear" -ge "$MAXFAIL" ] && escalate_once "$2" "approved $MAXFAIL times but prompt won't clear — keystrokes not landing?"
         return
       fi
     fi
-    fail=0; n=$((n+1)); echo "$(date +%H:%M:%S) approved [$3]: $(printf '%s' "$4" | cut -c1-140)" >> "$LOG"
+    reset_fails; n=$((n+1)); echo "$(date +%H:%M:%S) approved [$3]: $(printf '%s' "$4" | cut -c1-140)" >> "$LOG"
   else
-    rc=$?; fail=$((fail+1)); echo "$(date +%H:%M:%S) SEND-FAIL($fail/$MAXFAIL rc=$rc) [$3]: crew keys did not deliver" >> "$LOG"
-    [ "$fail" -ge "$MAXFAIL" ] && escalate_once "$2" "can't deliver keystrokes ($MAXFAIL tries, rc=$rc) — session unreachable"
+    why=$(printf '%s' "$kout" | tr '\n' ' ' | cut -c1-160)
+    f_send=$((f_send+1)); echo "$(date +%H:%M:%S) SEND-FAIL($f_send/$MAXFAIL rc=$rc) [$3]: $why" >> "$LOG"
+    [ "$f_send" -ge "$MAXFAIL" ] && escalate_once "$2" "can't deliver keystrokes ($MAXFAIL tries, rc=$rc): $why"
   fi
 }
 
 while [ "$(date +%s)" -lt "$end" ]; do
   st=$("$CREW" status 2>&1 | grep -F " $NAME " | grep -oE "waiting|busy|idle" | head -1)
   if [ "$st" != "waiting" ]; then
-    fail=0; esc_sig=""; sleep 6; continue
+    reset_fails; esc_sig=""; sleep 6; continue
   fi
   kd=$(classify "$NAME"); kind=$(printf '%s\n' "$kd" | sed -n 1p)
   detail=$(printf '%s\n' "$kd" | sed -n 2p); sig="$kind|$detail"
@@ -206,8 +238,8 @@ while [ "$(date +%s)" -lt "$end" ]; do
         escalate_once "$sig" "question/selection on screen needs you"
         echo "$(date +%H:%M:%S) HUMAN-ONLY (screen picker); not pressing Enter" >> "$LOG"
       else
-        fail=$((fail+1)); echo "$(date +%H:%M:%S) UNRECOGNIZED($fail/$MAXFAIL); not pressing Enter" >> "$LOG"
-        [ "$fail" -ge "$MAXFAIL" ] && escalate_once "$sig" "waiting on an unrecognized prompt shape — needs you"
+        f_unrec=$((f_unrec+1)); echo "$(date +%H:%M:%S) UNRECOGNIZED($f_unrec/$MAXFAIL); not pressing Enter" >> "$LOG"
+        [ "$f_unrec" -ge "$MAXFAIL" ] && escalate_once "$sig" "waiting on an unrecognized prompt shape — needs you"
       fi
       ;;
   esac

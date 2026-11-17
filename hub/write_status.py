@@ -55,6 +55,7 @@ def main():
                     help='replaces blockers; repeat per item (--blocker "" for none)')
     ap.add_argument('--device', help='device this work targets, if any')
     ap.add_argument('--app', help='status file basename; default = git root dir name')
+    ap.add_argument('--repo', help="the app's repo, for head/unpushed; remembered in the file")
     ap.add_argument('--show', action='store_true', help='print the file afterwards')
     a = ap.parse_args()
 
@@ -64,6 +65,26 @@ def main():
     status = pathlib.Path.home() / '.claude' / 'status' / f'{app}.json'
 
     d = json.loads(status.read_text()) if status.exists() else {'session': app}
+
+    # Git facts come from the APP's repo, not from wherever this was run.
+    # 2026-09-30 01:55: fusiontrainer ran this from ~/dev/crew/hub and recorded
+    # crew's HEAD and crew's dirty tree as its own. Precedence: --repo, then the
+    # repo remembered in the file, then cwd's repo. cwd's repo counts only when its
+    # name matches --app. Otherwise git facts are skipped, with a warning, rather
+    # than recorded from the wrong repo.
+    if a.repo:
+        root = git(pathlib.Path(a.repo).expanduser(), 'rev-parse', '--show-toplevel')
+        if not root:
+            print(f'--repo {a.repo} is not a git repo; git facts not recorded', file=sys.stderr)
+    elif d.get('repo'):
+        root = git(pathlib.Path(d['repo']), 'rev-parse', '--show-toplevel')
+    elif root and a.app and pathlib.Path(root).name.lower() != a.app.lower():
+        print(f"cwd's repo is {root}, which isn't --app {a.app}: head/unpushed NOT recorded. "
+              f"Pass --repo <path> once; it is remembered.", file=sys.stderr)
+        root = ''
+    if root:
+        repo = pathlib.Path(root)
+        d['repo'] = str(repo)
 
     # never passed in, always taken from the machine
     d['updated_at'] = subprocess.run(['date', '+%Y-%m-%dT%H:%M%z'],
